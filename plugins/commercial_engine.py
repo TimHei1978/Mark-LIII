@@ -158,12 +158,45 @@ def _base_url() -> str:
 
 def _run_production_in_background(project_id: str) -> None:
     try:
-        requests.post(f"{_base_url()}/api/commercial-projects/{project_id}/run", json={}, timeout=_RUN_TIMEOUT_SECONDS)
+        response = requests.post(f"{_base_url()}/api/commercial-projects/{project_id}/run", json={}, timeout=_RUN_TIMEOUT_SECONDS)
+        if response.ok:
+            _deliver_browser_draft(project_id)
     except Exception:
         # Swallowed on purpose: the Commercial Engine keeps the job's real result
         # (GENERATION_FAILED / READY / etc.) visible via GET .../status regardless
         # of whether THIS client-side call itself completed cleanly - see
         # check_video_production_status. No retry here (no unbounded loops).
+        pass
+
+
+def _deliver_browser_draft(project_id: str) -> None:
+    """Deliver a completed direct Jarvis production to TikTok Studio as a draft.
+    This flow never publishes a post."""
+    try:
+        created = requests.post(
+            f"{_base_url()}/api/tiktok/drafts",
+            json={"commercialProjectId": project_id, "deliveryMethod": "BROWSER"},
+            timeout=_CREATE_TIMEOUT_SECONDS,
+        )
+        if not created.ok:
+            return
+        draft_id = created.json().get("draftId")
+        if not isinstance(draft_id, str) or not draft_id:
+            return
+        approved = requests.post(
+            f"{_base_url()}/api/tiktok/browser/drafts/{draft_id}/approve",
+            json={},
+            timeout=_CREATE_TIMEOUT_SECONDS,
+        )
+        if approved.ok:
+            requests.post(
+                f"{_base_url()}/api/tiktok/browser/drafts/{draft_id}/upload",
+                json={},
+                timeout=_RUN_TIMEOUT_SECONDS,
+            )
+    except Exception:
+        # TikTok delivery must not invalidate a successfully rendered video.
+        # A failed draft can be retried without re-running production.
         pass
 
 
@@ -262,7 +295,12 @@ def run(parameters: dict, player=None, session_memory=None) -> str:
                     pass
             return result_text
 
-        body: dict = {"productName": product_name, "avatarMode": "NONE"}
+        body: dict = {
+            "productName": product_name,
+            "avatarMode": "NONE",
+            "caption": f"Entdecke {product_name}. Jetzt entdecken.",
+            "hashtags": ["werbung", "produkt"],
+        }
 
         description = parameters.get("product_description")
         if isinstance(description, str) and description.strip():
