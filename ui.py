@@ -708,6 +708,9 @@ class HudCanvas(QWidget):
         elif self.state == "LISTENING":
             sym = "●" if self._blink else "○"
             txt, col = f"{sym}  LISTENING",  qcol(C.GREEN)
+        elif self.state == "SLEEPING":
+            sym = "◌" if self._blink else "○"
+            txt, col = f"{sym}  SLEEPING — say 'Hey Jarvis'", qcol(C.ACC2)
         else:
             sym = "●" if self._blink else "○"
             txt, col = f"{sym}  {self.state}", qcol(C.PRI)

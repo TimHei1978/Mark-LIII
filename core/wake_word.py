@@ -21,6 +21,7 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Callable
 
@@ -30,6 +31,18 @@ WAKE_MODEL = "hey_jarvis"
 DEFAULT_THRESHOLD = 0.5
 # Mic frames arrive at 16 kHz int16; this is just the detector's input rate.
 SAMPLE_RATE = 16000
+# openwakeword's own Model.predict() supports a `patience` argument for
+# exactly this (require N consecutive above-threshold frames before firing),
+# but that needs the exact, version-suffixed model key (e.g. "hey_jarvis_v0.1")
+# up front - this module deliberately matches keys generically (see _loop(),
+# "jarvis" in k.lower()) so it keeps working across model version bumps
+# without a code change. Implementing the same "must stay confident" behaviour
+# here, keyed on nothing but the already-generic score, keeps that property.
+# Real hardware testing found a single 80ms frame over the 0.5 default
+# threshold firing on ordinary speech, not just "Hey Jarvis" - openwakeword's
+# own predict() docstring recommends exactly this kind of debouncing for
+# real deployments, its own defaults do not enable it.
+REQUIRED_CONSECUTIVE_FRAMES = 3
 
 
 def is_installed() -> bool:
@@ -83,6 +96,27 @@ def install_and_download(logger: Callable[[str], None] = print) -> tuple[bool, s
             if r.returncode != 0:
                 tail = (r.stderr or r.stdout or "").strip().splitlines()[-1:] or [""]
                 return False, f"pip install failed: {tail[0][:160]}"
+
+        # Some Windows machines sit behind a TLS-inspecting proxy or antivirus
+        # whose interception root is trusted by Windows (so git/browsers work
+        # fine) but NOT by certifi's bundled CA list, which is all `requests`
+        # (used by openwakeword's downloader) trusts by default — every model
+        # download then fails with "certificate verify failed: unable to get
+        # local issuer certificate", even though the network itself is fine.
+        # pip-system-certs patches Python's ssl/requests stack to also trust
+        # whatever Windows itself trusts, closing exactly that gap. Installed
+        # here (not requirements.txt) because it's only needed for this one
+        # network step, same "opt-in" spirit as openwakeword itself.
+        try:
+            import importlib.util
+            if importlib.util.find_spec("pip_system_certs") is None:
+                subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "pip-system-certs"],
+                    capture_output=True, text=True,
+                )
+        except Exception:
+            pass  # best-effort — the download below still works on machines without this issue
+
         # Download the pretrained melspectrogram/embedding + wake models.
         logger("Wake word: downloading models…")
         try:
@@ -111,15 +145,18 @@ class WakeWordDetector:
 
     def __init__(self, on_detect: Callable[[], None],
                  threshold: float = DEFAULT_THRESHOLD,
+                 required_consecutive_frames: int = REQUIRED_CONSECUTIVE_FRAMES,
                  logger: Callable[[str], None] = print):
         self._on_detect = on_detect
         self._threshold = threshold
+        self._required_consecutive_frames = max(1, required_consecutive_frames)
         self._logger    = logger
         self._queue: queue.Queue = queue.Queue(maxsize=50)
         self._thread: threading.Thread | None = None
         self._running = False
         self._model = None
         self._ready = False
+        self._consecutive_hits = 0
 
     def start(self) -> bool:
         """Load the model and spawn the inference thread. Returns True on success.
@@ -185,12 +222,25 @@ class WakeWordDetector:
                     if score == 0.0 and scores:
                         score = max(float(v) for v in scores.values())
                 if score >= self._threshold:
+                    self._consecutive_hits += 1
+                    if self._consecutive_hits < self._required_consecutive_frames:
+                        continue
+                    self._consecutive_hits = 0
+                    # Confidence is genuinely useful to keep (not debug-only):
+                    # a real hardware test surfaced a false-positive detection
+                    # at score 0.977 (well above the 0.5 default threshold) -
+                    # without this, a false wake looks identical to a real one
+                    # in the logs, and there is no way to judge whether raising
+                    # the threshold would even help a specific environment.
+                    self._logger(f"Wake word: detected (score={score:.3f}, threshold={self._threshold}, t={time.monotonic():.2f}).")
                     # drain any backlog so we don't double-fire on the same utterance
                     self._drain()
                     try:
                         self._on_detect()
                     except Exception as e:
                         self._logger(f"Wake word: on_detect error — {e}")
+                else:
+                    self._consecutive_hits = 0
             except Exception as e:
                 self._logger(f"Wake word: inference error — {e}")
 

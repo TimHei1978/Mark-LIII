@@ -22,7 +22,7 @@ It's not just an assistant — it's an extension of your digital life.
 ### Core Features
 | Feature | Description |
 |---|---|
-| 🎙️ Wake Word | Local **"Hey Jarvis"** detection — sleeps until called, auto-sleeps after 2 min of silence, and never streams audio while asleep. Opt-in, one-click download, toggle & manual sleep/wake from the UI |
+| 🎙️ Wake Word | Local **"Hey Jarvis"** detection — sleeps until called, sleeps again right after each answer, and never streams audio while asleep. Opt-in, one-click download, toggle & manual sleep/wake from the UI |
 | ⚡ Instant Acknowledgment | Speaks a short, context-aware reply in **your language** the instant a longer task starts — no more silent waiting |
 | 🚀 Faster Live Engine | Runs on **Gemini 3.1 Flash Live** — roughly 2× faster time-to-first-word than the previous model |
 | 🧩 Self-Describing Skills | Actions and plugins share one shape (`TOOL` / `PLUGIN` dict + `run()`), auto-discovered at launch — adding or moving a skill is a single file, no core edits |
@@ -73,7 +73,7 @@ It's not just an assistant — it's an extension of your digital life.
 Mark LIII is about making JARVIS **hands-free, faster, and easy to extend** — all universal: no hardcoded language, no bundled asset files, works the same on Windows, macOS and Linux.
 
 ### 🎙️ Wake Word — "Hey Jarvis"
-JARVIS can now sit quietly until you call it. Turn on **⚙ → WAKE WORD** (a one-click, opt-in download of a tiny local model) and it goes to sleep: the microphone is processed **only on your machine** by a local detector, and nothing is sent to the cloud until it hears **"Hey Jarvis."** Once awake it listens normally, then **auto-sleeps after 2 minutes** of silence. You can also **sleep/wake it by clicking** in the settings. Because it's a *local* gate, background chatter — *"I'm coming!"* to someone at home — never wakes it. It costs **zero** when off (the model isn't even loaded), and the detection runs in its own thread, so nothing else in the app slows down.
+JARVIS can now sit quietly until you call it. Turn on **⚙ → WAKE WORD** (a one-click, opt-in download of a tiny local model) and it goes to sleep: the microphone is processed **only on your machine** by a local detector, and nothing is sent to the cloud until it hears **"Hey Jarvis."** Once awake it listens normally, then **goes back to sleep right after it finishes answering** — no lingering "still listening" window — with a 2-minute no-speech timeout as a backstop in case a reply never lands (both configurable — see `wake_sleep_timeout_seconds` / `wake_word_threshold` in `config/api_keys.json`). You can also **sleep/wake it by clicking** in the settings. Because it's a *local* gate, background chatter — *"I'm coming!"* to someone at home — never wakes it. It costs **zero** when off (the model isn't even loaded), and the detection runs in its own thread, so nothing else in the app slows down.
 
 ### ⚡ Instant Acknowledgment
 No more silent gaps. When you ask for something that takes a moment — reading an uploaded file, a web/research search, building code — JARVIS **immediately** says one short, natural sentence *in your language* (*"Right away — going through that file now."*) and *then* runs the tool. Instant actions (opening an app, volume) stay snappy with no chatter.
@@ -211,6 +211,8 @@ python main.py
 `setup.py` only ever installs what your operating system needs — the Windows-only libraries are skipped automatically on macOS and Linux (and vice-versa). Prefer to do it by hand? `pip install -r requirements.txt` works too.
 
 > ⚠️ **Installation Note:** If you hit a `ModuleNotFoundError` for an OS-specific package, install it with `pip install <module_name>`. The optional **wake word** engine is *not* installed here — grab it in one click from **⚙ → WAKE WORD** inside the app.
+>
+> **Wake word download fails with an SSL/certificate error?** Some Windows machines sit behind a proxy or antivirus that intercepts HTTPS with its own certificate — one Windows itself trusts (so `git`/browsers work fine) but Python's own bundled certificate list doesn't. The ⚙ → WAKE WORD download now installs [`pip-system-certs`](https://pypi.org/project/pip-system-certs/) automatically the first time to bridge that gap; if it still fails, run `.venv/Scripts/python.exe -m pip install pip-system-certs` by hand and retry.
 
 ---
 

@@ -121,6 +121,57 @@ def save_wake_word_enabled(enabled: bool) -> None:
     CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
 
 
+# Mirrors core.wake_word.DEFAULT_THRESHOLD — kept as a plain literal here (not
+# imported) so config_manager never has to import openwakeword's own module.
+DEFAULT_WAKE_WORD_THRESHOLD = 0.5
+# Mirrors the previous hardcoded main.py module constant (WAKE_SLEEP_TIMEOUT).
+DEFAULT_WAKE_SLEEP_TIMEOUT_SECONDS = 120.0
+
+
+def get_wake_word_threshold() -> float:
+    """Detection score in [0,1] above which 'Hey Jarvis' counts as heard. Higher = fewer false wakes, but easier to miss a quiet 'Hey Jarvis'."""
+    value = load_api_keys().get("wake_word_threshold", DEFAULT_WAKE_WORD_THRESHOLD)
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_WAKE_WORD_THRESHOLD
+    return value if 0.0 < value <= 1.0 else DEFAULT_WAKE_WORD_THRESHOLD
+
+
+def save_wake_word_threshold(threshold: float) -> None:
+    ensure_config_dir()
+    data: dict = {}
+    if CONFIG_FILE.exists():
+        try:
+            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+    data["wake_word_threshold"] = threshold if 0.0 < threshold <= 1.0 else DEFAULT_WAKE_WORD_THRESHOLD
+    CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+
+
+def get_wake_sleep_timeout_seconds() -> float:
+    """Seconds of silence (while awake, not mid-response) before JARVIS auto-returns to wake-word standby."""
+    value = load_api_keys().get("wake_sleep_timeout_seconds", DEFAULT_WAKE_SLEEP_TIMEOUT_SECONDS)
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_WAKE_SLEEP_TIMEOUT_SECONDS
+    return value if value > 0 else DEFAULT_WAKE_SLEEP_TIMEOUT_SECONDS
+
+
+def save_wake_sleep_timeout_seconds(seconds: float) -> None:
+    ensure_config_dir()
+    data: dict = {}
+    if CONFIG_FILE.exists():
+        try:
+            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+    data["wake_sleep_timeout_seconds"] = seconds if seconds > 0 else DEFAULT_WAKE_SLEEP_TIMEOUT_SECONDS
+    CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+
+
 def get_brief_enabled() -> bool:
     return load_api_keys().get("morning_brief_enabled", True)
 

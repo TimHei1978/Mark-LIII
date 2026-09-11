@@ -70,6 +70,7 @@ from actions.background_monitor import (
 from actions.web_search        import _news as _fetch_news_sync
 from memory.config_manager     import (
     get_brief_enabled, get_voice, get_wake_word_enabled, save_wake_word_enabled,    get_input_device, get_output_device,
+    get_wake_word_threshold, get_wake_sleep_timeout_seconds,
 )
 from core.plugin_loader        import discover_plugins
 from core                      import undo as undo_stack
@@ -79,10 +80,6 @@ from core.action_loader        import discover_actions
 from core.wake_word            import (
     WakeWordDetector, is_ready as wake_is_ready, install_and_download as wake_install,
 )
-
-# How long the assistant stays awake with no user speech before it auto-sleeps
-# again (wake-word mode only).
-WAKE_SLEEP_TIMEOUT = 120.0   # seconds (2 minutes)
 
 def get_base_dir():
     if getattr(sys, "frozen", False):
@@ -428,7 +425,40 @@ class JarvisLive:
         self._wake_enabled     = get_wake_word_enabled()
         self._awake            = not self._wake_enabled
         self._wake_detector: WakeWordDetector | None = None
-        self._wake_sleep_timeout = WAKE_SLEEP_TIMEOUT
+        self._wake_sleep_timeout = get_wake_sleep_timeout_seconds()
+        # Real-user feedback (2026-09-11): a multi-minute open follow-up window
+        # was NOT what was wanted - every action should need a fresh "Hey
+        # Jarvis", not just the first one. _run_sleep_watch()'s idle timeout
+        # above stays as a safety-net backstop; this is what actually drives
+        # the day-to-day behaviour now. Delay is intentionally short-but-not-
+        # zero: it is rescheduled (never just fired once) on EVERY turn_complete,
+        # so a same-turn continuation (e.g. the vision image round-trip in
+        # _receive_audio) simply pushes it back instead of racing it.
+        self._post_response_sleep_task: asyncio.Task | None = None
+        self._post_response_sleep_delay = 1.2
+        # Real hardware test #2 (2026-09-11): a screen-vision request proved a
+        # fixed short delay alone is not enough - the FIRST turn_complete (a
+        # tool-ack) finishes playback well before the SECOND, real turn
+        # (Gemini's actual answer after seeing the image) has even been sent,
+        # let alone answered. True whenever a tool call or a vision follow-up
+        # means at least one more turn is coming - _play_audio() must not
+        # schedule a sleep while this is set, however long the round-trip takes.
+        self._awaiting_followup_turn = False
+        # Real hardware test #3 (2026-09-11): four rapid, high-confidence
+        # "Hey Jarvis" detections fired right after a real reply, traced to
+        # JARVIS's OWN trailing voice/echo reaching the mic the instant sleep()
+        # re-arms the detector - see the comment on sleep()/_asleep_since below.
+        # 0.0 (not time.monotonic()) so the very first, startup sleep period
+        # is never held back by a cooldown for speech that never happened.
+        self._asleep_since = 0.0
+        # Widened from an initial 0.8s: real hardware testing showed a false
+        # detection at score 0.967 still got through, and false positives have
+        # consistently scored HIGHER than genuine ones (0.967-0.988 vs.
+        # 0.849-0.887) - consistent with a clean, undistorted echo of JARVIS's
+        # OWN synthesized voice scoring cleaner than more casual human speech,
+        # not with random ambient noise. 3s gives real margin for a speaker
+        # buffer/room to fully settle; a user re-engaging that fast is rare.
+        self._detector_cooldown_seconds = 3.0
         # UI control surface for the Wake Word settings section.
         self.ui.wake_is_ready    = wake_is_ready          # () -> bool
         self.ui.wake_get_state   = self._wake_state       # () -> dict
@@ -449,6 +479,7 @@ class JarvisLive:
         if self._wake_detector is None:
             self._wake_detector = WakeWordDetector(
                 on_detect=self._on_wake_detected,
+                threshold=get_wake_word_threshold(),
                 logger=lambda m: (print(f"[Wake] {m}"), self.ui.write_log(f"SYS: {m}")),
             )
         if not self._wake_detector.ready:
@@ -463,6 +494,7 @@ class JarvisLive:
         if self._awake:
             return
         self._awake = True
+        self._cancel_pending_post_response_sleep()   # defensive - should already be resolved
         self._last_user_speech = time.monotonic()   # start the auto-sleep clock now
         if not self.ui.muted:
             self.ui.set_state("LISTENING")
@@ -472,9 +504,57 @@ class JarvisLive:
         if not self._awake:
             return
         self._awake = False
+        self._cancel_pending_post_response_sleep()   # whichever path triggered this sleep, no other timer should also fire
         self.set_speaking(False)
+        # Real hardware test #3 (2026-09-11): _is_speaking going False is a CODE
+        # signal, not a physical one - the speaker's own output buffer/driver and
+        # any room echo can keep JARVIS'S OWN VOICE audible for a beat after that.
+        # While awake, that risk is already covered (mic audio is only forwarded
+        # to Gemini when not jarvis_speaking, see _listen_audio) - there was no
+        # equivalent guard on the detector-feed path taken the instant we go back
+        # to sleep, and JARVIS's own voice very plausibly contains "Jarvis".
+        # Four rapid, high-confidence "detections" right after a real reply were
+        # traced to exactly this gap - _listen_audio's callback now checks it.
+        self._asleep_since = time.monotonic()
         self.ui.set_state("SLEEPING")
         self.ui.write_log(f"SYS: Sleeping — {reason}. Say 'Hey Jarvis' to wake me.")
+
+    def _schedule_post_response_sleep(self) -> None:
+        """Wake-word mode: return to standby shortly after EACH completed
+        response, rather than waiting out the full idle timeout - see the
+        __init__ comment on _post_response_sleep_task for why. Safe to call
+        on every turn_complete: cancels and replaces any already-pending
+        timer, so repeated calls just push the sleep back, never stack up
+        multiple pending sleeps."""
+        if not self._wake_enabled or not self._awake:
+            return
+        if self._post_response_sleep_task and not self._post_response_sleep_task.done():
+            self._post_response_sleep_task.cancel()
+
+        async def _go_to_sleep() -> None:
+            try:
+                await asyncio.sleep(self._post_response_sleep_delay)
+            except asyncio.CancelledError:
+                return
+            with self._speaking_lock:
+                speaking = self._is_speaking
+            if not speaking:
+                # Clear the reference to THIS task before calling sleep() - it
+                # cancels self._post_response_sleep_task if one is pending, and
+                # at this exact point that would otherwise BE this task,
+                # self-cancelling while already mid-return (Task.cancel() on a
+                # not-yet-done task from inside its own coroutine, observable
+                # as a CancelledError to anyone awaiting it from outside).
+                self._post_response_sleep_task = None
+                self.sleep(reason="response complete")
+
+        self._post_response_sleep_task = asyncio.create_task(_go_to_sleep())
+
+    def _cancel_pending_post_response_sleep(self) -> None:
+        """Called when the user starts a new utterance - a sleep that was
+        about to fire must not cut off speech that is actively in progress."""
+        if self._post_response_sleep_task and not self._post_response_sleep_task.done():
+            self._post_response_sleep_task.cancel()
 
     async def _run_sleep_watch(self) -> None:
         """Auto-sleep after the configured silence window (wake-word mode only)."""
@@ -931,6 +1011,14 @@ class JarvisLive:
             # only a queue push, so the audio path is never slowed. When wake word
             # is off (default) or we're awake, this is a single boolean check.
             if self._wake_enabled and not self._awake:
+                # Cooldown after JUST going to sleep - JARVIS's own trailing
+                # voice/echo can still be physically audible for a beat after
+                # set_speaking(False) (a code signal, not a guarantee the
+                # speaker buffer has actually drained). Real hardware test #3:
+                # this exact gap produced four rapid, high-confidence false
+                # "Hey Jarvis" detections right after a real reply.
+                if time.monotonic() - self._asleep_since < self._detector_cooldown_seconds:
+                    return
                 det = self._wake_detector
                 if det is not None:
                     det.feed(indata)
@@ -1040,10 +1128,20 @@ class JarvisLive:
                             if txt:
                                 in_buf.append(txt)
                                 self._last_user_speech = time.monotonic()
+                                self._cancel_pending_post_response_sleep()
 
                         if sc.turn_complete:
                             if self._turn_done_event:
                                 self._turn_done_event.set()
+
+                            # Tentatively "nothing more expected" - the vision-send
+                            # block below (still in this same turn_complete) sets
+                            # this back to True if it actually sends a follow-up.
+                            # A tool-call-triggered wait (set when response.tool_call
+                            # was seen, in an earlier iteration of this loop) is
+                            # exactly what THIS turn_complete is now delivering the
+                            # answer for, so clearing it here is correct either way.
+                            self._awaiting_followup_turn = False
 
                             # If this turn_complete ends an interrupted response, clear the
                             # flag and skip all further processing for that turn.
@@ -1082,6 +1180,7 @@ class JarvisLive:
                                 import base64 as _b64
                                 img_b, mime_t, question, angle = self._pending_vision
                                 self._pending_vision = None
+                                self._awaiting_followup_turn = True   # the real answer is still to come
                                 b64 = _b64.b64encode(img_b).decode("ascii")
                                 print(f"[Vision] 📤 {len(img_b):,} bytes (angle={angle}) → main session")
                                 await self.session.send_client_content(
@@ -1109,6 +1208,12 @@ class JarvisLive:
                                 asyncio.create_task(_cam_close())
 
                     if response.tool_call:
+                        # A tool call always means at least one more turn is
+                        # coming once the result is back - set BEFORE running
+                        # any tool (some take real time), so _play_audio() can
+                        # never observe "done" from a stale prior turn while
+                        # this one is still being worked on.
+                        self._awaiting_followup_turn = True
                         fn_responses = []
                         for fc in response.tool_call.function_calls:
                             print(f"[JARVIS] 📞 {fc.name}")
@@ -1168,6 +1273,27 @@ class JarvisLive:
                     ):
                         self.set_speaking(False)
                         self._turn_done_event.clear()
+                        # THIS is when a response is actually, fully delivered
+                        # (audio done playing) - not turn_complete, which only
+                        # means Gemini finished GENERATING and can fire while
+                        # playback is still catching up on the queued audio.
+                        # Scheduling from turn_complete instead was tried first
+                        # and, confirmed in real testing, left JARVIS awake
+                        # indefinitely: the grace timer kept finding
+                        # _is_speaking already True (or about to become True)
+                        # and skipping, with nothing left to re-trigger it once
+                        # playback actually finished.
+                        #
+                        # A tool-call/vision round-trip is a SECOND real hardware
+                        # bug found on top of that: this exact "turn done" event
+                        # fires for the tool-ack turn too, well before the real
+                        # follow-up answer has even been sent, let alone played -
+                        # _awaiting_followup_turn (set on response.tool_call / a
+                        # vision send) is what keeps this from scheduling early;
+                        # the loop naturally re-checks on the NEXT turn's own
+                        # completion once that flag is finally clear again.
+                        if not self._awaiting_followup_turn:
+                            self._schedule_post_response_sleep()
                     continue
 
                 self.set_speaking(True)
