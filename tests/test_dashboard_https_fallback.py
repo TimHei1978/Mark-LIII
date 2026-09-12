@@ -21,6 +21,7 @@ import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -118,9 +119,23 @@ class VerifyHttpsSelfTestTests(unittest.IsolatedAsyncioTestCase):
 
 class AutoLoginPairingKeyTests(unittest.TestCase):
     """The QR code's actual target - validates the whole visible bug is fixed
-    end-to-end at the route level, not just in the URL-string helpers."""
+    end-to-end at the route level, not just in the URL-string helpers.
+
+    /auto-login also writes a trusted-device record to disk (see
+    tests/test_remote_control_sessions.py for that feature's own coverage) -
+    DEVICE_SESSIONS_PATH is redirected to a throwaway file for every test
+    here so this file never touches the real, local
+    config/remote_devices.json on the machine running the suite."""
 
     def setUp(self):
+        self._tmpdir = TemporaryDirectory()
+        self._device_store_patcher = patch.object(
+            dashboard_server, "DEVICE_SESSIONS_PATH",
+            Path(self._tmpdir.name) / "remote_devices.json",
+        )
+        self._device_store_patcher.start()
+        self.addCleanup(self._device_store_patcher.stop)
+        self.addCleanup(self._tmpdir.cleanup)
         self.d = _make_dashboard()
         self.client = TestClient(self.d.app)
 

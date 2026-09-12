@@ -61,7 +61,7 @@ It's not just an assistant — it's an extension of your digital life.
 | 🎬 YouTube Control | Search, play, and control YouTube playback by voice |
 | 🖱️ Desktop Control | Taskbar, window management, and desktop-level operations |
 | 🧑‍💻 Silent Language Memory | Detects spoken language on first use — all future sessions adapt automatically |
-| 📱 Remote Dashboard | Control the assistant from your phone via QR code pairing |
+| 📱 Remote Dashboard | Control the assistant from your phone via QR code pairing — scan once, stays paired across normal restarts |
 | ⚡ Auto-Start on Boot | Registers with the OS startup system (registry / LaunchAgent / .desktop) |
 | 📋 Clipboard Intelligence | Copy any text → floating panel with Translate / Summarise / Explain / Fix |
 | 🪪 Assistant Customization | Change the assistant name, your name, voice, and colour from the UI — takes effect immediately |
@@ -215,6 +215,8 @@ python main.py
 > **Wake word download fails with an SSL/certificate error?** Some Windows machines sit behind a proxy or antivirus that intercepts HTTPS with its own certificate — one Windows itself trusts (so `git`/browsers work fine) but Python's own bundled certificate list doesn't. The ⚙ → WAKE WORD download now installs [`pip-system-certs`](https://pypi.org/project/pip-system-certs/) automatically the first time to bridge that gap; if it still fails, run `.venv/Scripts/python.exe -m pip install pip-system-certs` by hand and retry.
 >
 > **Remote Dashboard QR code / manual address don't connect from your phone?** JARVIS tests its own HTTPS at startup and only advertises `https://` if a real local handshake succeeds — some consumer antivirus suites (Norton, G DATA, and similar HTTPS/SSL-scanning features) intercept and reset self-signed TLS connections, even on `127.0.0.1`, which no code-level fix can disable from JARVIS's side. When that happens, JARVIS automatically falls back to a single plain `http://<your-ip>:8000` address for both the QR code and manual entry (no more mismatched 8000/8001) — logged clearly as `[Dashboard] HTTPS handshake failed on this machine...`. This is exactly as secure for remote control itself: commands and audio are already encrypted at the application layer (AES-256-CBC, session-key-derived) independent of the transport. If your phone still can't reach it, confirm it's on the **same local network** as this PC (not a guest/isolated WiFi) and that Windows Firewall's `JARVIS Dashboard Port 8000` inbound rule is enabled for the **Private** profile.
+>
+> **Do I have to scan the QR code again after every restart?** No. The QR code / 6-character key is only for pairing a phone the first time (or re-pairing one that's been revoked) — kept deliberately short-lived and single-use, never made to last longer. Once scanned, the phone gets a separate, longer-lived trusted-device token (`config/remote_devices.json`, gitignored, local-only) that survives normal JARVIS restarts — reopening the dashboard just quietly re-authenticates in the background, no new scan needed. That trust lasts **30 days**, or until revoked via an authenticated call to `/api/revoke-devices` (invalidates every paired device immediately and permanently — no GUI button for this yet, call it directly if you need it). Generating a *new* QR code (e.g. to pair a second phone) never invalidates devices already paired.
 
 ---
 

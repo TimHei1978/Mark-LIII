@@ -47,6 +47,15 @@ STATIC_DIR  = Path(__file__).parent / "static"
 PORT        = 8000
 MAX_UPLOAD_MB = 500
 
+# Trusted-device store: survives a JARVIS restart on purpose (unlike _tokens/
+# _pending_keys below, which stay RAM-only and are meant to be short-lived -
+# see DashboardServer.__init__). Local runtime state, not a secret to ship or
+# commit - same spirit as config/certs/, gitignored the same way.
+DEVICE_SESSIONS_PATH = BASE_DIR / "config" / "remote_devices.json"
+# 30 days: a previously-paired phone stays trusted without re-scanning a QR
+# code, but trust still has a finite lifetime rather than never expiring.
+DEVICE_SESSION_LIFETIME_SECONDS = 30 * 24 * 60 * 60
+
 
 def _make_uploads_dir() -> Path:
     """Return (and create) the cross-platform uploads folder."""
@@ -371,6 +380,19 @@ def _read(name: str) -> str:
     return (STATIC_DIR / name).read_text(encoding="utf-8")
 
 
+def _load_device_sessions() -> dict[str, dict]:
+    """Read the trusted-device store back in at startup. Never raises — a
+    missing, empty, or corrupt file just means no device is trusted yet
+    (the same fail-open-to-"nothing trusted" behaviour as every other local
+    JSON state file in this app, e.g. _ssl_enabled()'s cert check)."""
+    try:
+        import json as _json
+        data = _json.loads(DEVICE_SESSIONS_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
 # ── DashboardServer ───────────────────────────────────────────────────────────
 
 class DashboardServer:
@@ -393,7 +415,14 @@ class DashboardServer:
         self._wake_callback               = None
         self._connect_callback            = None
         self._pending_keys: dict[str, float] = {}
-        self._device_sessions: dict[str, dict] = {}  # device_token → {session_key}
+        # device_token → {session_key, created_at} — loaded from disk so an
+        # already-paired phone survives a normal restart without re-scanning
+        # a QR code (see DEVICE_SESSIONS_PATH). _tokens/_pending_keys above
+        # stay RAM-only on purpose: the whole point of the split is that the
+        # short-lived pairing key and the live session token both get
+        # re-derived on demand from this one persistent trust record, via
+        # /api/device-login, rather than being persisted themselves.
+        self._device_sessions: dict[str, dict] = _load_device_sessions()
         self._phone_audio_queue: asyncio.Queue    = asyncio.Queue(maxsize=200)
         self._uploads_dir                 = UPLOADS_DIR
         self._login_html                  = _read("login.html")
@@ -408,6 +437,20 @@ class DashboardServer:
         key = ''.join(secrets.choice(_KEY_CHARS) for _ in range(6))
         self._pending_keys[key] = now + expiry_secs
         return key
+
+    def _save_device_sessions(self) -> None:
+        """Persist the trusted-device store. Best-effort — a write failure
+        here must not break pairing/login themselves, only the (already
+        degraded-gracefully, see dashboard/static/login.html) case of
+        surviving the next restart."""
+        try:
+            import json as _json
+            DEVICE_SESSIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            DEVICE_SESSIONS_PATH.write_text(
+                _json.dumps(self._device_sessions), encoding="utf-8"
+            )
+        except Exception:
+            pass
 
     def _ssl_enabled(self) -> bool:
         """Whether HTTPS should be advertised/used. Prefers the real, tested
@@ -581,7 +624,8 @@ class DashboardServer:
             self._tokens.add(tok)
             self._token_keys[tok] = key
             self._aes_key(key)
-            self._device_sessions[dev_tok] = {"session_key": key}
+            self._device_sessions[dev_tok] = {"session_key": key, "created_at": time.time()}
+            self._save_device_sessions()
 
             if self._connect_callback:
                 self._connect_callback()
@@ -616,7 +660,15 @@ class DashboardServer:
             dev_tok = (body.get("device_token") or "").strip()
             if not dev_tok or dev_tok not in self._device_sessions:
                 return JSONResponse({"ok": False}, status_code=401)
-            session_key = self._device_sessions[dev_tok]["session_key"]
+            record = self._device_sessions[dev_tok]
+            # Fail closed: a record with no created_at (shouldn't happen for
+            # anything written by this version) is treated as expired rather
+            # than trusted indefinitely.
+            if time.time() - record.get("created_at", 0) > DEVICE_SESSION_LIFETIME_SECONDS:
+                del self._device_sessions[dev_tok]
+                self._save_device_sessions()
+                return JSONResponse({"ok": False}, status_code=401)
+            session_key = record["session_key"]
             tok = secrets.token_urlsafe(32)
             self._tokens.add(tok)
             self._token_keys[tok] = session_key
@@ -635,6 +687,7 @@ class DashboardServer:
                 return JSONResponse({"error": "Unauthorized"}, status_code=401)
             count = len(self._device_sessions)
             self._device_sessions.clear()
+            self._save_device_sessions()
             return JSONResponse({"ok": True, "revoked": count})
 
         @app.post("/api/command")

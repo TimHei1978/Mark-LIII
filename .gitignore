@@ -12,6 +12,10 @@ config/certs/
 # a LINKED WhatsApp session — committing it hands somebody your WhatsApp
 # account, not just a key
 config/whatsapp_web/
+# trusted-device tokens for the Remote Control dashboard — long-lived bearer
+# credentials for whichever phones you've paired, not a password but still
+# not something to publish
+config/remote_devices.json
 # Google OAuth tokens (Gmail / Calendar plugins)
 **/token*.json
 # Google OAuth client secrets
