@@ -1,8 +1,13 @@
 """
-dashboard/server.py — JARVIS Local HTTP Dashboard
+dashboard/server.py — JARVIS Local HTTP(S) Dashboard
 
-Plain HTTP on port 8000 (no SSL warnings, no firewall issues).
-Security at the application layer: AES-256-CBC with session-key-derived key.
+HTTPS on port 8000 when a local cert exists AND a real handshake actually
+succeeds (self-tested at startup, see DashboardServer._verify_https) — some
+local security software intercepts/resets self-signed TLS even on 127.0.0.1,
+so a working handshake is verified, not just assumed from the cert files'
+presence. Falls back to plain HTTP on the same port otherwise — still works,
+still secured at the application layer: AES-256-CBC with a session-key-derived
+key, independent of transport encryption.
 CryptoJS is auto-downloaded once and served locally — no CDN needed after that.
 
 Install deps:  pip install fastapi "uvicorn[standard]" cryptography
@@ -11,8 +16,10 @@ Install deps:  pip install fastapi "uvicorn[standard]" cryptography
 import asyncio
 import base64
 import hashlib
+import os
 import re
 import secrets
+import shutil
 import socket
 import string
 import time
@@ -370,6 +377,13 @@ class DashboardServer:
 
     def __init__(self):
         self._ip                          = _local_ip()
+        # None = not tested yet (falls back to the file-existence check below);
+        # set once by serve() after a real local handshake self-test — see
+        # _verify_https(). Needed because some local security software (HTTPS/SSL
+        # scanning in consumer AV suites) intercepts and resets TLS connections to
+        # a self-signed cert even on 127.0.0.1, so "the key/cert files exist" is
+        # not proof HTTPS is actually usable on this machine.
+        self._https_verified: bool | None = None
         self._tokens: set[str]            = set()
         self._token_keys: dict[str, str]  = {}   # auth_token → session_key
         self._aes_cache:  dict[str, bytes]= {}   # session_key → AES bytes
@@ -395,10 +409,56 @@ class DashboardServer:
         self._pending_keys[key] = now + expiry_secs
         return key
 
-    @staticmethod
-    def _ssl_enabled() -> bool:
+    def _ssl_enabled(self) -> bool:
+        """Whether HTTPS should be advertised/used. Prefers the real, tested
+        result from _verify_https() (set once by serve()); falls back to the
+        plain file-existence check only before that test has run."""
+        if self._https_verified is not None:
+            return self._https_verified
         certs = BASE_DIR / "config" / "certs"
         return (certs / "jarvis.key").exists() and (certs / "jarvis.crt").exists()
+
+    async def _verify_https(self) -> bool:
+        """Real local self-test: does a TLS handshake to our own HTTPS port
+        actually complete? Some local security software (HTTPS/SSL-scanning in
+        consumer AV suites) intercepts local TLS traffic - including 127.0.0.1 -
+        at the OS TLS layer (Windows SChannel) and resets connections it can't
+        cleanly re-sign. That's invisible to a Python ssl-module client, which
+        uses its own bundled OpenSSL and never touches SChannel at all - a pure-
+        Python probe here would report success even while every SChannel-based
+        client (curl.exe, browsers, WinINet apps) gets reset. curl.exe ships
+        with Windows 10 1803+/11 by default and IS SChannel-based, so it is used
+        here as the real probe; the Python-only check is kept as a fallback for
+        systems without curl (older Windows, or other platforms)."""
+        curl = shutil.which("curl")
+        if curl:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    curl, "-sk", "-o", os.devnull, "-w", "%{http_code}",
+                    "--max-time", "3", f"https://127.0.0.1:{PORT}/",
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+                return stdout.decode().strip().startswith(("2", "3", "4"))  # any real HTTP response
+            except Exception:
+                return False
+
+        import ssl as _ssl
+        ctx = _ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = _ssl.CERT_NONE
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection("127.0.0.1", PORT, ssl=ctx), timeout=3.0
+            )
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+            return True
+        except Exception:
+            return False
 
     def get_url(self) -> str:
         proto = "https" if self._ssl_enabled() else "http"
@@ -776,19 +836,56 @@ class DashboardServer:
         # no waiting for UAC dialogs or subprocess timeouts.
         asyncio.get_event_loop().run_in_executor(None, _ensure_network_access, PORT)
 
-        use_ssl  = self._ssl_enabled()
-        ssl_key  = BASE_DIR / "config" / "certs" / "jarvis.key"
-        ssl_cert = BASE_DIR / "config" / "certs" / "jarvis.crt"
+        certs        = BASE_DIR / "config" / "certs"
+        ssl_key      = certs / "jarvis.key"
+        ssl_cert     = certs / "jarvis.crt"
+        certs_present = ssl_key.exists() and ssl_cert.exists()
+
+        use_ssl = False
+        server_task: asyncio.Task | None = None
+
+        if certs_present:
+            # Start HTTPS provisionally, then really test it — cert files existing
+            # is not proof HTTPS actually works on this machine (see _verify_https).
+            probe_cfg = uvicorn.Config(
+                self.app, host="0.0.0.0", port=PORT, log_level="warning",
+                ssl_keyfile=str(ssl_key), ssl_certfile=str(ssl_cert),
+            )
+            probe_server = uvicorn.Server(probe_cfg)
+            probe_task = asyncio.create_task(probe_server.serve())
+            await asyncio.sleep(0.5)  # let uvicorn actually bind before probing it
+            use_ssl = await self._verify_https()
+            if use_ssl:
+                server_task = probe_task
+            else:
+                print("[Dashboard] HTTPS handshake failed on this machine (often local "
+                      "security-software HTTPS/SSL scanning interfering with a "
+                      "self-signed cert, even on 127.0.0.1) — falling back to plain "
+                      "HTTP for local network access.")
+                # should_exit triggers uvicorn's own graceful shutdown, which actually
+                # closes the listening socket before probe_task finishes — a raw
+                # .cancel() returns control to us before the OS has released the
+                # port, and the plain-HTTP rebind below then fails with "address
+                # already in use" (found via a real restart, not assumed).
+                probe_server.should_exit = True
+                try:
+                    await asyncio.wait_for(probe_task, timeout=5.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    probe_task.cancel()
+                    try:
+                        await probe_task
+                    except asyncio.CancelledError:
+                        pass
+
+        self._https_verified = use_ssl
 
         if use_ssl:
             asyncio.create_task(self._serve_alias())
-
-        cfg = uvicorn.Config(
-            self.app, host="0.0.0.0", port=PORT, log_level="warning",
-            **({"ssl_keyfile": str(ssl_key), "ssl_certfile": str(ssl_cert)} if use_ssl else {}),
-        )
+        else:
+            cfg = uvicorn.Config(self.app, host="0.0.0.0", port=PORT, log_level="warning")
+            server_task = asyncio.create_task(uvicorn.Server(cfg).serve())
 
         proto = "https" if use_ssl else "http"
         print(f"[Dashboard] {proto}://{self._ip}:{PORT}")
         print("[Dashboard] Press 'Remote Control' in JARVIS UI to get the QR code.")
-        await uvicorn.Server(cfg).serve()
+        await server_task
