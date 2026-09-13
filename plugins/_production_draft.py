@@ -30,12 +30,25 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Optional
 
-# Category 1/2 share the real Commercial Engine voice + subtitle pipeline
-# (see AI Content Factory COMPONENTS/telegram-production-bot.md, "OmniVoice-
-# Integration & Kategorie-2-Korrektur") - both fields are only REQUIRED when
-# category is 1 or 2. Category 3 (Higgsfield) is explicitly out of scope for
-# this change (Auftrag: "Category 3 nicht ungeprueft aendern").
-_CATEGORIES_REQUIRING_VOICE_AND_SUBTITLE = (1, 2)
+# Category 1/2/3 all share the real Commercial Engine voice + subtitle
+# pipeline (see AI Content Factory COMPONENTS/telegram-production-bot.md,
+# "OmniVoice-Integration & Kategorie-2-Korrektur"). Category 3 was excluded
+# here by an earlier, now-superseded task ("Category 3 nicht ungeprueft
+# aendern") - the later Auftrag "Kategorie 3 / Higgsfield zu einer echten
+# Premium-Werbevideo-Pipeline reparieren" (2026-09-13) explicitly requires
+# Jarvis to use "die gleichen Felder wie Telegram (voicePreference,
+# subtitleStyle, category), keine zweite Kategorie-3-Engine" - Telegram now
+# asks voice+subtitle for category 3 too (see apps/telegram-bot/src/
+# updateHandler.ts continueFlow()), so Jarvis must match.
+_CATEGORIES_REQUIRING_VOICE_AND_SUBTITLE = (1, 2, 3)
+# Category 3 (Higgsfield) is a paid cloud service - real money, unlike
+# category 1/2's local compute. Telegram gates it behind an explicit tap on
+# category3ConfirmKeyboard() BEFORE even asking voice/subtitle; Jarvis has no
+# tap equivalent, so it gates on this explicit, never-inferred confirmation
+# flag instead (see PLUGIN's category3_confirmed parameter description in
+# commercial_engine.py - Gemini may only set it after literally telling the
+# user this costs real money and hearing them agree).
+_CATEGORY_REQUIRING_COST_CONFIRMATION = 3
 
 
 @dataclass(frozen=True)
@@ -59,6 +72,10 @@ class PendingProductionDraft:
     platform: Optional[str] = None
     voice_preference: Optional[str] = None  # "male" | "female" | "auto"
     subtitle_style: Optional[str] = None  # "clean" | "tiktok_dynamic" | "premium" | "auto"
+    # Only ever set to True (never False - see merged_with()'s "falsy means no
+    # update" filter), and only by an explicit user confirmation after being
+    # told category 3 incurs real cost. Mirrors Telegram's Draft.category3Confirmed.
+    category3_confirmed: Optional[bool] = None
 
     def merged_with(self, **updates: object) -> "PendingProductionDraft":
         """Returns a NEW draft with only the non-empty supplied fields overlaid -
@@ -72,9 +89,17 @@ class PendingProductionDraft:
         erfragt, nie bereits bekannte erneut. category selbst wird hier NICHT als
         fehlend gefuehrt - der bestehende Default (siehe commercial_engine.py,
         _DEFAULT_PRODUCTION_CATEGORY) bleibt unveraendert, das war schon vor diesem
-        Auftrag so und ist nicht Teil dieser Aenderung."""
+        Auftrag so und ist nicht Teil dieser Aenderung.
+
+        Kategorie 3: die Kosten-Bestaetigung wird ALLEIN zurueckgegeben (nicht
+        gebuendelt mit Stimme/Untertitel) - mirrort Telegrams strikte Reihenfolge
+        Bestaetigung -> Stimme -> Untertitel (siehe updateHandler.ts continueFlow():
+        die Stimm-Tastatur wird dort ebenfalls erst NACH der Bestaetigung gezeigt,
+        nie gleichzeitig)."""
         if self.category not in _CATEGORIES_REQUIRING_VOICE_AND_SUBTITLE:
             return []
+        if self.category == _CATEGORY_REQUIRING_COST_CONFIRMATION and not self.category3_confirmed:
+            return ["category3_confirmation"]
         missing = []
         if not self.voice_preference:
             missing.append("voice_preference")

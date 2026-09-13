@@ -70,10 +70,11 @@ class PluginDiscoveryTests(unittest.TestCase):
     def test_dispatch_through_the_real_registry_reaches_our_run_function(self):
         """End-to-end through PluginRegistry.run() (the exact call main.py itself makes),
         not just calling our own run() directly - proves the loader's dispatch/exception
-        wrapping/parameter-passing conventions are actually satisfied. category 3 is used
-        here specifically because it needs neither voice_preference nor subtitle_style
-        (see _production_draft.py) - this test is about dispatch plumbing, not the
-        conversational flow (covered exhaustively in test_commercial_engine_plugin.py)."""
+        wrapping/parameter-passing conventions are actually satisfied. category 1/2/3 all
+        require category3_confirmed (category 3 only)/voice_preference/subtitle_style
+        before firing (see _production_draft.py) - supplied here explicitly since this
+        test is about dispatch plumbing, not the conversational flow (covered exhaustively
+        in test_commercial_engine_plugin.py)."""
         from unittest.mock import MagicMock, patch
 
         registry = discover_plugins(plugins_dir=PLUGINS_DIR, core_tool_names=set(), logger=lambda _msg: None)
@@ -82,7 +83,10 @@ class PluginDiscoveryTests(unittest.TestCase):
             resp.json.return_value = {"projectId": "proj-dispatch"}
             mock_post.return_value = resp
             result = registry.run(
-                "create_video_production_request", {"product_name": "Kaffeebecher", "category": 3}, player=None, session_memory=None
+                "create_video_production_request",
+                {"product_name": "Kaffeebecher", "category": 3, "category3_confirmed": True, "voice_preference": "auto", "subtitle_style": "auto"},
+                player=None,
+                session_memory=None,
             )
         self.assertIn("proj-dispatch", result)
 

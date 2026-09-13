@@ -114,11 +114,14 @@ class CreateVideoProductionRequestTests(unittest.TestCase):
     @patch("plugins.commercial_engine.threading.Thread")
     @patch("plugins.commercial_engine.requests.post")
     def test_category_3_is_forwarded(self, mock_post, mock_thread):
-        # Category 3 needs neither voice_preference nor subtitle_style (see
-        # _production_draft.missing_required_fields) - deliberately NOT supplied
-        # here, proving category 3 fires immediately without them.
+        # Auftrag "Kategorie 3 / Higgsfield" (2026-09-13): category 3 now needs
+        # the SAME real-cost confirmation + voice_preference + subtitle_style as
+        # category 1/2 before it fires (see _production_draft.missing_required_fields
+        # and CategoryThreeConfirmationTests below) - all three supplied here since
+        # this test is specifically about the category field being forwarded, not
+        # about that dialog.
         mock_post.return_value = _fake_response(201, {"projectId": "proj-cat3"})
-        plugin.run({"product_name": "Stuhl", "category": 3})
+        plugin.run({"product_name": "Stuhl", "category": 3, "category3_confirmed": True, **_VOICE_AND_SUBTITLE_KNOWN})
         self.assertEqual(mock_post.call_args[1]["json"]["category"], 3)
 
     @patch("plugins.commercial_engine.threading.Thread")
@@ -551,10 +554,14 @@ class MissingVoiceAndSubtitlePreferenceTests(unittest.TestCase):
         self.assertIn("stimme", result.lower())
 
     @patch("plugins.commercial_engine.requests.post")
-    def test_category_3_never_asks_for_voice_or_subtitle(self, mock_post):
-        mock_post.return_value = _fake_response(201, {"projectId": "proj-cat3-direct"})
+    def test_category_3_asks_for_cost_confirmation_before_voice_or_subtitle(self, mock_post):
+        # Superseded by Auftrag "Kategorie 3 / Higgsfield" (2026-09-13): category 3
+        # is a paid cloud service and now requires the same real-cost confirmation
+        # gate Telegram already has (category3ConfirmKeyboard), asked BEFORE
+        # voice/subtitle - see CategoryThreeConfirmationTests below for the full flow.
         result = plugin.run({"product_name": "Massagebrille", "category": 3})
-        self.assertIn("proj-cat3-direct", result)
+        mock_post.assert_not_called()
+        self.assertIn("kosten", result.lower())
 
     @patch("plugins.commercial_engine.requests.post")
     def test_a_correction_before_completion_overwrites_the_earlier_answer(self, mock_post):
@@ -574,6 +581,94 @@ class MissingVoiceAndSubtitlePreferenceTests(unittest.TestCase):
         plugin.run({"product_name": "Massagebrille", "category": 1, "voice_preference": "auto", "subtitle_style": "cinematic"})
         pending = _production_draft.get_pending()
         self.assertIsNone(pending.subtitle_style)
+
+
+class CategoryThreeConfirmationTests(unittest.TestCase):
+    """Auftrag 'Kategorie 3 / Higgsfield zu einer echten Premium-Werbevideo-
+    Pipeline reparieren' (2026-09-13): "Jarvis MUSS die gleichen Felder wie
+    Telegram verwenden (voicePreference, subtitleStyle, category), keine
+    zweite Kategorie-3-Engine" - Telegram gates category 3 behind an explicit
+    tap on category3ConfirmKeyboard() BEFORE asking voice/subtitle (real
+    Higgsfield cost); these tests prove Jarvis now has the matching gate,
+    asked FIRST, and that category 1/2 remain completely unaffected."""
+
+    def setUp(self):
+        _production_draft.clear_pending()
+
+    def tearDown(self):
+        _production_draft.clear_pending()
+
+    @patch("plugins.commercial_engine.requests.post")
+    def test_category_3_without_confirmation_asks_for_it_and_does_not_call_the_api(self, mock_post):
+        result = plugin.run({"product_name": "Dampfbuegler", "category": 3})
+        mock_post.assert_not_called()
+        self.assertEqual(result, plugin._QUESTION_BY_MISSING_FIELD["category3_confirmation"])
+
+    @patch("plugins.commercial_engine.requests.post")
+    def test_category_3_confirmation_question_is_remembered_as_a_pending_draft(self, mock_post):
+        plugin.run({"product_name": "Dampfbuegler", "category": 3})
+        pending = _production_draft.get_pending()
+        self.assertIsNotNone(pending)
+        self.assertEqual(pending.product_name, "Dampfbuegler")
+        self.assertEqual(pending.category, 3)
+        self.assertIsNone(pending.category3_confirmed)
+
+    @patch("plugins.commercial_engine.requests.post")
+    def test_category_3_confirmed_but_voice_still_missing_asks_for_voice_next_not_starting(self, mock_post):
+        plugin.run({"product_name": "Dampfbuegler", "category": 3})
+        result = plugin.run({"category3_confirmed": True})
+        mock_post.assert_not_called()
+        self.assertIn("stimme", result.lower())
+
+    @patch("plugins.commercial_engine.threading.Thread")
+    @patch("plugins.commercial_engine.requests.post")
+    def test_confirm_then_voice_then_subtitle_finally_starts_exactly_one_job(self, mock_post, mock_thread):
+        mock_post.return_value = _fake_response(201, {"projectId": "proj-cat3-dialog"})
+        plugin.run({"product_name": "Dampfbuegler", "category": 3})
+        plugin.run({"category3_confirmed": True})
+        plugin.run({"voice_preference": "female"})
+        result = plugin.run({"subtitle_style": "premium"})
+
+        mock_post.assert_called_once()
+        body = mock_post.call_args[1]["json"]
+        self.assertEqual(body["productName"], "Dampfbuegler")
+        self.assertEqual(body["category"], 3)
+        self.assertEqual(body["voicePreference"], "female")
+        self.assertEqual(body["subtitleStyle"], "premium")
+        self.assertNotIn("category3Confirmed", body, "category3_confirmed is a Jarvis-side gate only, not a Commercial Engine API field")
+        self.assertIn("proj-cat3-dialog", result)
+
+    @patch("plugins.commercial_engine.threading.Thread")
+    @patch("plugins.commercial_engine.requests.post")
+    def test_a_fully_complete_single_category_3_command_never_asks_anything(self, mock_post, mock_thread):
+        # Auftrag Beispiel: "Kategorie 3, ja ich bestaetige die Kosten, weibliche Stimme, Premium-Untertitel" in one turn.
+        mock_post.return_value = _fake_response(201, {"projectId": "proj-cat3-direct"})
+        result = plugin.run({
+            "product_name": "Dampfbuegler",
+            "category": 3,
+            "category3_confirmed": True,
+            "voice_preference": "female",
+            "subtitle_style": "premium",
+        })
+        mock_post.assert_called_once()
+        self.assertIn("proj-cat3-direct", result)
+
+    @patch("plugins.commercial_engine.requests.post")
+    def test_category_1_is_completely_unaffected_by_the_new_category_3_gate(self, mock_post):
+        # Non-regression: category 1/2 must still fire with only voice+subtitle,
+        # no confirmation question of any kind (category3_confirmation only
+        # applies when category == 3, see _production_draft.missing_required_fields).
+        with patch("plugins.commercial_engine.threading.Thread"):
+            mock_post.return_value = _fake_response(201, {"projectId": "proj-cat1-unaffected"})
+            result = plugin.run({"product_name": "Stuhl", "category": 1, **_VOICE_AND_SUBTITLE_KNOWN})
+        self.assertIn("proj-cat1-unaffected", result)
+
+    def test_a_bare_true_for_category3_confirmed_is_never_forwarded_as_a_string_or_truthy_garbage(self):
+        # Only a literal JSON boolean true counts (see _normalized_true) - a
+        # string like "true" or "yes" must not be silently accepted as confirmation.
+        plugin.run({"product_name": "Dampfbuegler", "category": 3, "category3_confirmed": "true"})
+        pending = _production_draft.get_pending()
+        self.assertIsNone(pending.category3_confirmed)
 
 
 class CancelProductionDraftTests(unittest.TestCase):

@@ -84,7 +84,7 @@ PLUGIN = {
         "this for general video playback, editing, or YouTube search (see youtube_video "
         "for that) - this is exclusively for STARTING a new production job in our own "
         "pipeline.\n\n"
-        "IMPORTANT - MISSING VOICE/SUBTITLE PREFERENCE PROTOCOL: for category 1 or 2 "
+        "IMPORTANT - MISSING VOICE/SUBTITLE PREFERENCE PROTOCOL: for category 1, 2, or 3 "
         "(whether the user said so explicitly or it defaulted), a German voice AND a "
         "subtitle style are required before production can start. If either is missing, "
         "this function does NOT start anything - it returns a short spoken question "
@@ -93,7 +93,15 @@ PLUGIN = {
         "once the user answers, passing voice_preference and/or subtitle_style (you do not "
         "need to repeat product_name/category/etc. - they are remembered - but repeating "
         "them is harmless). If the user cancels ('cancel', 'never mind', 'stop'), call "
-        "cancel_production_draft instead of calling this function again."
+        "cancel_production_draft instead of calling this function again.\n\n"
+        "IMPORTANT - CATEGORY 3 REAL-COST CONFIRMATION PROTOCOL: category 3 (Higgsfield) "
+        "is a paid cloud service, unlike category 1/2 which run locally for free. Before "
+        "category 3 can start, you must first tell the user this incurs real cost and ask "
+        "them to confirm. If category is 3 and category3_confirmed is not yet true, this "
+        "function returns a short spoken question asking for that confirmation FIRST - "
+        "before even asking about voice/subtitle. Only call this function again with "
+        "category3_confirmed=true once the user has clearly agreed (e.g. 'yes', 'go "
+        "ahead', 'that's fine') - never set it preemptively, never infer it from silence."
     ),
     "parameters": {
         "type": "OBJECT",
@@ -167,7 +175,7 @@ PLUGIN = {
             "voice_preference": {
                 "type": "STRING",
                 "description": (
-                    "German voice for category 1/2 productions: 'male', 'female', or 'auto' (no "
+                    "German voice for category 1/2/3 productions: 'male', 'female', or 'auto' (no "
                     "preference/let the system choose). Only set this if the user said or answered "
                     "this. Map 'maennlich'/'Mann'/'male' -> male, 'weiblich'/'Frau'/'female' -> female, "
                     "'egal'/'keine Praeferenz'/'such du aus'/'auto' -> auto."
@@ -176,11 +184,20 @@ PLUGIN = {
             "subtitle_style": {
                 "type": "STRING",
                 "description": (
-                    "Subtitle style for category 1/2 productions: 'clean', 'tiktok_dynamic', 'premium', "
+                    "Subtitle style for category 1/2/3 productions: 'clean', 'tiktok_dynamic', 'premium', "
                     "or 'auto' (derive it from the product's marketing angle instead of a fixed style). "
                     "Only set this if the user said or answered this. Map 'clean'/'schlicht' -> clean, "
                     "'TikTok Dynamic'/'dynamisch'/'TikTok-Stil' -> tiktok_dynamic, 'Premium'/'hochwertig'/"
                     "'elegant' -> premium, 'Auto'/'such du aus'/'keine Praeferenz' -> auto."
+                ),
+            },
+            "category3_confirmed": {
+                "type": "BOOLEAN",
+                "description": (
+                    "Set this to true ONLY after you have told the user that category 3 (Higgsfield) "
+                    "is a paid cloud service that incurs real cost, and the user has clearly confirmed "
+                    "they still want to proceed. Never set this preemptively, never set it to false - "
+                    "just omit it entirely until the user has actually agreed."
                 ),
             },
         },
@@ -215,6 +232,7 @@ _ALLOWED_SUBTITLE_STYLES = {"clean", "tiktok_dynamic", "premium", "auto"}
 # fehlendem Feld - kein Meta-Text, das ist es, was der Nutzer tatsaechlich
 # hoert (siehe run()'s Rueckgabewert).
 _QUESTION_BY_MISSING_FIELD = {
+    "category3_confirmation": "Kategorie 3 nutzt Higgsfield, einen kostenpflichtigen Cloud-Anbieter, und verursacht echte Kosten. Soll ich trotzdem fortfahren?",
     "voice_preference": "Männliche, weibliche Stimme oder keine Präferenz?",
     "subtitle_style": "Clean, TikTok Dynamic, Premium oder Auto?",
 }
@@ -370,6 +388,13 @@ def _normalized_choice(parameters: dict, key: str, allowed: set[str]) -> str | N
     return None
 
 
+def _normalized_true(parameters: dict, key: str) -> bool | None:
+    """Only ever returns True or None - never False (see PendingProductionDraft.
+    category3_confirmed: a confirmation is either explicitly given or not yet
+    known, there is no real "explicitly un-confirmed" state to forward)."""
+    return True if parameters.get(key) is True else None
+
+
 def _merge_parameters_into_pending(parameters: dict) -> PendingProductionDraft:
     """Auftrag Abschnitt 31/33/39: baut den (moeglicherweise bereits teilweise
     bekannten) Entwurf aus dem vorherigen Turn UND den neu gelieferten Feldern -
@@ -395,6 +420,7 @@ def _merge_parameters_into_pending(parameters: dict) -> PendingProductionDraft:
         platform=parameters.get("platform"),
         voice_preference=_normalized_choice(parameters, "voice_preference", _ALLOWED_VOICE_PREFERENCES),
         subtitle_style=_normalized_choice(parameters, "subtitle_style", _ALLOWED_SUBTITLE_STYLES),
+        category3_confirmed=_normalized_true(parameters, "category3_confirmed"),
     )
 
 
@@ -432,7 +458,7 @@ def run(parameters: dict, player=None, session_memory=None) -> str:
         # category loest sich wie bisher auf einen konkreten Wert auf (explizit
         # ODER der bestehende Default), BEVOR die Pflichtfeld-Pruefung laeuft -
         # missing_required_fields() braucht eine konkrete category, um zu wissen,
-        # ob Voice/Subtitle ueberhaupt relevant sind (nur Kategorie 1/2).
+        # ob Voice/Subtitle/Kosten-Bestaetigung ueberhaupt relevant sind (Kategorie 1/2/3).
         resolved_category = draft.category if draft.category in (1, 2, 3) else _DEFAULT_PRODUCTION_CATEGORY
         draft = draft.merged_with(category=resolved_category)
 
@@ -520,9 +546,8 @@ def run(parameters: dict, player=None, session_memory=None) -> str:
 
         # Gemeinsame, kanalneutrale Production Options (Auftrag Abschnitt 45/46:
         # "Keine channel-spezifischen Backend-Felder... zentral: voicePreference,
-        # subtitleStyle") - nur fuer Kategorie 1/2 ueberhaupt erfragt (siehe
-        # missing_required_fields()), aber hier unconditional durchgereicht, falls
-        # doch vorhanden (z. B. Kategorie 3 mit einer frueher gesetzten Praeferenz).
+        # subtitleStyle") - fuer Kategorie 1/2/3 gleichermassen erfragt (siehe
+        # missing_required_fields()), hier unconditional durchgereicht.
         if draft.voice_preference:
             body["voicePreference"] = draft.voice_preference
         if draft.subtitle_style:
