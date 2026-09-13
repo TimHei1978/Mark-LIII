@@ -63,8 +63,11 @@ from __future__ import annotations
 
 import os
 import threading
+from dataclasses import asdict
 
 import requests
+
+from ._production_draft import PendingProductionDraft, clear_pending, get_pending, set_pending
 
 PLUGIN = {
     "name": "create_video_production_request",
@@ -80,7 +83,17 @@ PLUGIN = {
         "check_video_production_status afterwards to find out when it's done. Do NOT use "
         "this for general video playback, editing, or YouTube search (see youtube_video "
         "for that) - this is exclusively for STARTING a new production job in our own "
-        "pipeline."
+        "pipeline.\n\n"
+        "IMPORTANT - MISSING VOICE/SUBTITLE PREFERENCE PROTOCOL: for category 1 or 2 "
+        "(whether the user said so explicitly or it defaulted), a German voice AND a "
+        "subtitle style are required before production can start. If either is missing, "
+        "this function does NOT start anything - it returns a short spoken question "
+        "instead (asking ONLY for what is still missing, never repeating what is already "
+        "known) and remembers everything supplied so far. Call this SAME function again "
+        "once the user answers, passing voice_preference and/or subtitle_style (you do not "
+        "need to repeat product_name/category/etc. - they are remembered - but repeating "
+        "them is harmless). If the user cancels ('cancel', 'never mind', 'stop'), call "
+        "cancel_production_draft instead of calling this function again."
     ),
     "parameters": {
         "type": "OBJECT",
@@ -103,6 +116,18 @@ PLUGIN = {
             "reference_image": {
                 "type": "STRING",
                 "description": "Local file path (on this computer) to a real product photo, only if the user gave or clearly referenced one.",
+            },
+            "reference_images": {
+                "type": "ARRAY",
+                "items": {"type": "STRING"},
+                "description": (
+                    "Use this INSTEAD of reference_image when MULTIPLE product photos were just uploaded "
+                    "(you will have seen more than one path in a recent '[FILES_UPLOADED]' context message). "
+                    "List ALL of their local file paths here, in the same order they were uploaded, so they "
+                    "become ONE video production job that uses every photo - never call this function once "
+                    "per photo. Leave out entirely for a single photo (use reference_image instead) or when "
+                    "no photo was given."
+                ),
             },
             "duration_seconds": {
                 "type": "NUMBER",
@@ -127,6 +152,25 @@ PLUGIN = {
                 "type": "STRING",
                 "description": "Target publishing platform for compliance labeling: tiktok, instagram, youtube, facebook, or other. Omit if not mentioned.",
             },
+            "voice_preference": {
+                "type": "STRING",
+                "description": (
+                    "German voice for category 1/2 productions: 'male', 'female', or 'auto' (no "
+                    "preference/let the system choose). Only set this if the user said or answered "
+                    "this. Map 'maennlich'/'Mann'/'male' -> male, 'weiblich'/'Frau'/'female' -> female, "
+                    "'egal'/'keine Praeferenz'/'such du aus'/'auto' -> auto."
+                ),
+            },
+            "subtitle_style": {
+                "type": "STRING",
+                "description": (
+                    "Subtitle style for category 1/2 productions: 'clean', 'tiktok_dynamic', 'premium', "
+                    "or 'auto' (derive it from the product's marketing angle instead of a fixed style). "
+                    "Only set this if the user said or answered this. Map 'clean'/'schlicht' -> clean, "
+                    "'TikTok Dynamic'/'dynamisch'/'TikTok-Stil' -> tiktok_dynamic, 'Premium'/'hochwertig'/"
+                    "'elegant' -> premium, 'Auto'/'such du aus'/'keine Praeferenz' -> auto."
+                ),
+            },
         },
         "required": ["product_name"],
     },
@@ -146,6 +190,15 @@ _RUN_TIMEOUT_SECONDS = 3 * 60 * 60
 _ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 _ALLOWED_ASPECT_RATIOS = {"9:16", "16:9", "1:1", "4:3", "3:4", "9:21", "21:9"}
 _ALLOWED_PLATFORMS = {"tiktok", "instagram", "youtube", "facebook", "other"}
+_ALLOWED_VOICE_PREFERENCES = {"male", "female", "auto"}
+_ALLOWED_SUBTITLE_STYLES = {"clean", "tiktok_dynamic", "premium", "auto"}
+# Auftrag Abschnitt 27/31: EIN kurzer, natuerlicher gesprochener Satz pro
+# fehlendem Feld - kein Meta-Text, das ist es, was der Nutzer tatsaechlich
+# hoert (siehe run()'s Rueckgabewert).
+_QUESTION_BY_MISSING_FIELD = {
+    "voice_preference": "Männliche, weibliche Stimme oder keine Präferenz?",
+    "subtitle_style": "Clean, TikTok Dynamic, Premium oder Auto?",
+}
 
 
 def _base_url() -> str:
@@ -261,25 +314,104 @@ def _validate_reference_image(raw_path: str) -> tuple[str | None, str | None]:
     return abs_path, None
 
 
+def _normalized_choice(parameters: dict, key: str, allowed: set[str]) -> str | None:
+    value = parameters.get(key)
+    if isinstance(value, str) and value.strip().lower() in allowed:
+        return value.strip().lower()
+    return None
+
+
+def _merge_parameters_into_pending(parameters: dict) -> PendingProductionDraft:
+    """Auftrag Abschnitt 31/33/39: baut den (moeglicherweise bereits teilweise
+    bekannten) Entwurf aus dem vorherigen Turn UND den neu gelieferten Feldern -
+    ueberschreibt NIE ein bereits bekanntes Feld mit einem fehlenden, erlaubt aber
+    Korrekturen (ein neu geliefertes Feld gewinnt immer, siehe merged_with())."""
+    base = get_pending() or PendingProductionDraft()
+    category = parameters.get("category")
+    raw_images = parameters.get("reference_images")
+    reference_images = (
+        tuple(str(p) for p in raw_images if isinstance(p, str) and p.strip())
+        if isinstance(raw_images, list) and raw_images
+        else None
+    )
+    return base.merged_with(
+        product_name=str(parameters.get("product_name") or "").strip() or None,
+        product_description=parameters.get("product_description"),
+        creative_notes=parameters.get("creative_notes"),
+        reference_image=parameters.get("reference_image"),
+        reference_images=reference_images,
+        duration_seconds=parameters.get("duration_seconds"),
+        category=int(category) if isinstance(category, (int, float)) and int(category) in (1, 2, 3) else None,
+        aspect_ratio=parameters.get("aspect_ratio"),
+        platform=parameters.get("platform"),
+        voice_preference=_normalized_choice(parameters, "voice_preference", _ALLOWED_VOICE_PREFERENCES),
+        subtitle_style=_normalized_choice(parameters, "subtitle_style", _ALLOWED_SUBTITLE_STYLES),
+    )
+
+
 def run(parameters: dict, player=None, session_memory=None) -> str:
     try:
-        product_name = str(parameters.get("product_name") or "").strip()
+        draft = _merge_parameters_into_pending(parameters)
+        product_name = draft.product_name or ""
         if not product_name:
+            # Kein Pending-Zustand fuer ein Produkt, das noch nicht einmal einen
+            # Namen hat - nichts zu merken, unveraendertes bisheriges Verhalten.
+            clear_pending()
             return "I need at least a product name to start a video production."
 
-        reference_image = parameters.get("reference_image")
-        validated_image_ref: str | None = None
-        if isinstance(reference_image, str) and reference_image.strip():
-            validated_image_ref, image_error = _validate_reference_image(reference_image)
+        # category loest sich wie bisher auf einen konkreten Wert auf (explizit
+        # ODER der bestehende Default), BEVOR die Pflichtfeld-Pruefung laeuft -
+        # missing_required_fields() braucht eine konkrete category, um zu wissen,
+        # ob Voice/Subtitle ueberhaupt relevant sind (nur Kategorie 1/2).
+        resolved_category = draft.category if draft.category in (1, 2, 3) else _DEFAULT_PRODUCTION_CATEGORY
+        draft = draft.merged_with(category=resolved_category)
+
+        missing = draft.missing_required_fields()
+        if missing:
+            set_pending(draft)
+            question = _QUESTION_BY_MISSING_FIELD[missing[0]]
+            if player:
+                try:
+                    player.write_log(f"JARVIS: {question}")
+                except Exception:
+                    pass
+            return question
+
+        # Alles Noetige ist bekannt - der Entwurf wird jetzt tatsaechlich
+        # gestartet, Pending-Zustand danach in JEDEM Fall geloescht (Erfolg,
+        # Ablehnung durch die API, oder unerwarteter Fehler unten) - ein
+        # fehlgeschlagener Versuch soll nicht denselben Entwurf endlos erneut
+        # anbieten.
+        clear_pending()
+
+        # reference_images (plural, deterministic upload order) takes precedence
+        # when present - a single reference_image is the exact same one-element
+        # case, so existing single-image callers/tests are unaffected either way.
+        image_candidates: list[str] = (
+            list(draft.reference_images)
+            if draft.reference_images
+            else ([draft.reference_image] if isinstance(draft.reference_image, str) and draft.reference_image.strip() else [])
+        )
+        validated_image_refs: list[str] = []
+        for raw_image in image_candidates:
+            validated_ref, image_error = _validate_reference_image(raw_image)
             if image_error:
                 return image_error
+            validated_image_refs.append(validated_ref)
 
         webhook_url = _n8n_webhook_url()
         if webhook_url:
             # See module docstring, OPTIONAL GEMINI CREATIVE LAYER / n8n PATH + KNOWN LIMITATION.
             threading.Thread(
                 target=_run_via_n8n,
-                args=(webhook_url, product_name, parameters, validated_image_ref),
+                # dataclasses.asdict(draft) statt des rohen parameters-Dicts: der
+                # n8n-Pfad soll denselben, ueber mehrere Turns akkumulierten
+                # Wissensstand sehen wie der direkte Pfad oben, nicht nur die
+                # Felder DIESES einen Funktionsaufrufs.
+                # n8n path stays single-image only for now (documented KNOWN
+                # LIMITATION above, deliberately not extended here) - the first
+                # validated image (cover/primary) is passed, same as before.
+                args=(webhook_url, product_name, asdict(draft), validated_image_refs[0] if validated_image_refs else None),
                 daemon=True,
                 name=f"acf-n8n-{product_name[:20]}",
             ).start()
@@ -302,30 +434,38 @@ def run(parameters: dict, player=None, session_memory=None) -> str:
             "hashtags": ["werbung", "produkt"],
         }
 
-        description = parameters.get("product_description")
-        if isinstance(description, str) and description.strip():
-            body["productDescription"] = description.strip()
+        if isinstance(draft.product_description, str) and draft.product_description.strip():
+            body["productDescription"] = draft.product_description.strip()
 
-        duration = parameters.get("duration_seconds")
-        if isinstance(duration, (int, float)) and duration > 0:
-            body["videoDurationSeconds"] = float(duration)
+        if isinstance(draft.duration_seconds, (int, float)) and draft.duration_seconds > 0:
+            body["videoDurationSeconds"] = float(draft.duration_seconds)
 
-        category = parameters.get("category")
-        if isinstance(category, (int, float)) and int(category) in (1, 2, 3):
-            body["category"] = int(category)
-        else:
-            body["category"] = _DEFAULT_PRODUCTION_CATEGORY
+        body["category"] = resolved_category
 
-        aspect_ratio = parameters.get("aspect_ratio")
-        if isinstance(aspect_ratio, str) and aspect_ratio in _ALLOWED_ASPECT_RATIOS:
-            body["aspectRatio"] = aspect_ratio
+        if isinstance(draft.aspect_ratio, str) and draft.aspect_ratio in _ALLOWED_ASPECT_RATIOS:
+            body["aspectRatio"] = draft.aspect_ratio
 
-        platform = parameters.get("platform")
-        if isinstance(platform, str) and platform.strip().lower() in _ALLOWED_PLATFORMS:
-            body["platform"] = platform.strip().upper()
+        if isinstance(draft.platform, str) and draft.platform.strip().lower() in _ALLOWED_PLATFORMS:
+            body["platform"] = draft.platform.strip().upper()
 
-        if validated_image_ref:
-            body["productImageRef"] = validated_image_ref
+        # Gemeinsame, kanalneutrale Production Options (Auftrag Abschnitt 45/46:
+        # "Keine channel-spezifischen Backend-Felder... zentral: voicePreference,
+        # subtitleStyle") - nur fuer Kategorie 1/2 ueberhaupt erfragt (siehe
+        # missing_required_fields()), aber hier unconditional durchgereicht, falls
+        # doch vorhanden (z. B. Kategorie 3 mit einer frueher gesetzten Praeferenz).
+        if draft.voice_preference:
+            body["voicePreference"] = draft.voice_preference
+        if draft.subtitle_style:
+            body["subtitleStyle"] = draft.subtitle_style
+
+        if validated_image_refs:
+            # Same dual-field shape apps/telegram-bot/src/production.ts already
+            # sends (productImageRef = first/cover image, productImageRefs = all,
+            # in upload order) - apps/api's CommercialOrchestrator already
+            # distributes productImageRefs round-robin across generated scenes
+            # (resolveSceneReferenceImages), so nothing downstream needed to change.
+            body["productImageRef"] = validated_image_refs[0]
+            body["productImageRefs"] = validated_image_refs
 
         try:
             response = requests.post(f"{_base_url()}/api/commercial-projects", json=body, timeout=_CREATE_TIMEOUT_SECONDS)

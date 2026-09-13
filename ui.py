@@ -930,14 +930,18 @@ def _fmt_size(size: int) -> str:
 
 
 class FileDropZone(QWidget):
-    file_selected = pyqtSignal(str)
+    # Emits the full, deterministically-ordered list of selected files (drop/
+    # browse order preserved) - always a list, even for a single file (`[path]`),
+    # so callers never need two separate code paths. Single-file consumers use
+    # current_file()/current_file (the first entry) unchanged - see JarvisUI.current_file.
+    files_selected = pyqtSignal(list)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAcceptDrops(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFixedHeight(100)
-        self._current_file: str | None = None
+        self._current_files: list[str] = []
         self._hovering  = False
         self._drag_over = False
         self._dash_offset = 0.0
@@ -971,10 +975,12 @@ class FileDropZone(QWidget):
     def dropEvent(self, e: QDropEvent):
         self._drag_over = False
         urls = e.mimeData().urls()
-        if urls:
-            path = urls[0].toLocalFile()
-            if Path(path).is_file():
-                self._set_file(path)
+        # Deterministic order (Auftrag: "Deterministische Reihenfolge") - the
+        # OS/Qt already hands urls() in the order the files were dropped;
+        # simply preserved here, not re-sorted.
+        paths = [u.toLocalFile() for u in urls if Path(u.toLocalFile()).is_file()]
+        if paths:
+            self._set_files(paths)
         self._canvas.update()
 
     def mousePressEvent(self, e):
@@ -988,14 +994,21 @@ class FileDropZone(QWidget):
         self._hovering = False; self._canvas.update()
 
     def current_file(self) -> str | None:
-        return self._current_file
+        """Backward-compatible single-file accessor - the FIRST selected file,
+        or None. Existing single-file consumers (e.g. the file_processor
+        plugin's auto-fill in main.py) keep working unchanged."""
+        return self._current_files[0] if self._current_files else None
+
+    def current_files(self) -> list[str]:
+        """Full, deterministically-ordered list of currently selected files."""
+        return list(self._current_files)
 
     def clear_file(self):
-        self._current_file = None; self._canvas.update()
+        self._current_files = []; self._canvas.update()
 
     def _browse(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Select a file for JARVIS", str(Path.home()),
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Select file(s) for JARVIS", str(Path.home()),
             "All Files (*.*);;"
             "Images (*.jpg *.jpeg *.png *.gif *.webp *.bmp *.svg);;"
             "Documents (*.pdf *.docx *.txt *.md *.pptx);;"
@@ -1005,13 +1018,13 @@ class FileDropZone(QWidget):
             "Video (*.mp4 *.avi *.mov *.mkv *.wmv *.webm);;"
             "Archives (*.zip *.rar *.tar *.gz *.7z)",
         )
-        if path:
-            self._set_file(path)
+        if paths:
+            self._set_files(paths)
 
-    def _set_file(self, path: str):
-        self._current_file = path
+    def _set_files(self, paths: list[str]):
+        self._current_files = paths
         self._canvas.update()
-        self.file_selected.emit(path)
+        self.files_selected.emit(paths)
 
 
 class _DropCanvas(QWidget):
@@ -1033,7 +1046,7 @@ class _DropCanvas(QWidget):
         p.setBrush(QBrush(bg_col)); p.setPen(Qt.PenStyle.NoPen)
         p.drawRoundedRect(rect, 6, 6)
 
-        if z._current_file:   border_col = qcol(C.GREEN, 200)
+        if z._current_files:  border_col = qcol(C.GREEN, 200)
         elif z._drag_over:    border_col = qcol(C.PRI, 230)
         elif z._hovering:     border_col = qcol(C.BORDER_B, 200)
         else:                 border_col = qcol(C.BORDER, 160)
@@ -1043,7 +1056,7 @@ class _DropCanvas(QWidget):
         p.setPen(pen); p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawRoundedRect(rect, 6, 6)
 
-        if z._current_file:   self._paint_file(p, W, H)
+        if z._current_files:  self._paint_file(p, W, H)
         elif z._drag_over:    self._paint_drag_over(p, W, H)
         else:                 self._paint_idle(p, W, H, z._hovering)
 
@@ -1076,7 +1089,13 @@ class _DropCanvas(QWidget):
         p.drawText(QRectF(0, cy + 12, W, 16), Qt.AlignmentFlag.AlignCenter, "Release to load")
 
     def _paint_file(self, p, W, H):
-        path = Path(self._z._current_file)
+        files = self._z._current_files
+        if len(files) == 1:
+            self._paint_single_file(p, W, H, Path(files[0]))
+        else:
+            self._paint_multi_file(p, W, H, files)
+
+    def _paint_single_file(self, p, W, H, path: Path):
         cat  = _file_category(path)
         icon, icon_col = _FILE_ICONS.get(cat, _FILE_ICONS["unknown"])
         size_str = _fmt_size(path.stat().st_size)
@@ -1113,9 +1132,37 @@ class _DropCanvas(QWidget):
         p.setPen(QPen(qcol(C.RED, 180), 1))
         p.drawText(QRectF(W - 34, 0, 28, H), Qt.AlignmentFlag.AlignCenter, "✕")
 
+    def _paint_multi_file(self, p, W, H, files: list[str]):
+        block_x, block_w = 10, 60
+        p.setFont(QFont("Segoe UI Emoji", 22) if _OS == "Windows" else QFont("Arial", 22))
+        p.setPen(QPen(qcol(C.GREEN), 1))
+        p.drawText(QRectF(block_x, 0, block_w, H), Qt.AlignmentFlag.AlignCenter, "🗂")
+
+        tx = block_x + block_w + 6
+        tw = W - tx - 38
+
+        p.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        p.setPen(QPen(qcol(C.WHITE), 1))
+        p.drawText(QRectF(tx, H * 0.18, tw, 16),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                   f"{len(files)} files selected")
+
+        p.setFont(QFont("Courier New", 7))
+        p.setPen(QPen(qcol(C.TEXT_DIM), 1))
+        first_name = Path(files[0]).name
+        if len(first_name) > 28: first_name = first_name[:25] + "..."
+        more = len(files) - 1
+        summary = f"{first_name}  + {more} more" if more else first_name
+        p.drawText(QRectF(tx, H * 0.18 + 18, tw, 14),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, summary)
+
+        p.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+        p.setPen(QPen(qcol(C.RED, 180), 1))
+        p.drawText(QRectF(W - 34, 0, 28, H), Qt.AlignmentFlag.AlignCenter, "✕")
+
     def mousePressEvent(self, e):
         z = self._z
-        if z._current_file and e.pos().x() > self.width() - 34:
+        if z._current_files and e.pos().x() > self.width() - 34:
             z.clear_file()
         else:
             z.mousePressEvent(e)
@@ -2787,6 +2834,7 @@ class MainWindow(QMainWindow):
         self.wake_get_state    = None   # callable: () -> dict {enabled, awake, ready}
         self._muted            = False
         self._current_file: str | None = None
+        self._current_files: list[str] = []
         self._remote_overlay: RemoteKeyOverlay | None = None
         self._customize_overlay: CustomizeOverlay | None = None
 
@@ -3603,7 +3651,7 @@ class MainWindow(QMainWindow):
 
         lay.addWidget(_sec("FILE UPLOAD"))
         self._drop_zone = FileDropZone()
-        self._drop_zone.file_selected.connect(self._on_file_selected)
+        self._drop_zone.files_selected.connect(self._on_file_selected)
         lay.addWidget(self._drop_zone)
 
         self._file_hint = QLabel("No file loaded — drop or click above to upload")
@@ -3959,8 +4007,17 @@ class MainWindow(QMainWindow):
         lay.addWidget(_fl("By FatihMakes", C.PRI_DIM))
         return w
 
-    def _on_file_selected(self, path: str):
-        self._current_file = path
+    def _on_file_selected(self, paths: list[str]):
+        self._current_files = paths
+        self._current_file  = paths[0] if paths else None
+        if not paths:
+            return
+        if len(paths) == 1:
+            self._on_single_file_selected(paths[0])
+        else:
+            self._on_multiple_files_selected(paths)
+
+    def _on_single_file_selected(self, path: str):
         p    = Path(path)
         cat  = _file_category(p)
         icon, _ = _FILE_ICONS.get(cat, _FILE_ICONS["unknown"])
@@ -3973,6 +4030,26 @@ class MainWindow(QMainWindow):
                 f"type={p.suffix.lstrip('.')} | size={size} | "
                 f"Briefly tell the user you can see the file '{p.name}' "
                 f"({size}) has been uploaded and ask what they'd like to do with it."
+            )
+            threading.Thread(target=self.on_text_command, args=(msg,), daemon=True).start()
+
+    def _on_multiple_files_selected(self, paths: list[str]):
+        # Deterministic order preserved as received from FileDropZone (drop/browse
+        # order) - this becomes the order product images are attached to the ONE
+        # draft/job created for all of them (see Mark-LII/plugins/_production_draft.py).
+        names      = [Path(p).name for p in paths]
+        total_size = _fmt_size(sum(Path(p).stat().st_size for p in paths))
+        shown      = ", ".join(names[:3]) + (f", +{len(names) - 3} more" if len(names) > 3 else "")
+        self._file_hint.setText(
+            f"🗂  {len(paths)} files  ·  {total_size}  ·  Tell {self._assistant_name} what to do with them"
+        )
+        self._log.append_log(f"FILE: {len(paths)} files loaded ({total_size}): {shown}")
+        if self.on_text_command:
+            file_list = " | ".join(f"path={p} name={Path(p).name}" for p in paths)
+            msg = (
+                f"[FILES_UPLOADED] count={len(paths)} | {file_list} | "
+                f"Briefly tell the user you can see the {len(paths)} uploaded files "
+                f"({shown}) and ask what they'd like to do with them."
             )
             threading.Thread(target=self.on_text_command, args=(msg,), daemon=True).start()
 
@@ -4546,6 +4623,10 @@ class JarvisUI:
     @property
     def current_file(self) -> str | None:
         return self._win._drop_zone.current_file()
+
+    @property
+    def current_files(self) -> list[str]:
+        return self._win._drop_zone.current_files()
 
     @property
     def on_text_command(self):

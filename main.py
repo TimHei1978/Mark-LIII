@@ -961,6 +961,19 @@ class JarvisLive:
 
             else:
                 if self._plugin_registry.has(name):
+                    # create_video_production_request: fall back to the currently
+                    # uploaded file(s) when Gemini didn't already supply either
+                    # image argument itself - same auto-fill precedent as
+                    # file_processor/current_file above, extended to the plural
+                    # case so multiple selected images become ONE draft (see
+                    # plugins/commercial_engine.py's reference_images parameter).
+                    if (name == "create_video_production_request"
+                            and not args.get("reference_image") and not args.get("reference_images")):
+                        _files = self.ui.current_files
+                        if len(_files) == 1:
+                            args["reference_image"] = _files[0]
+                        elif len(_files) > 1:
+                            args["reference_images"] = _files
                     r = await loop.run_in_executor(
                         None,
                         lambda: self._plugin_registry.run(name, args, player=self.ui, session_memory=None)
