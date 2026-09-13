@@ -25,7 +25,9 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -365,6 +367,108 @@ class MultipleReferenceImagesTests(unittest.TestCase):
         self.assertEqual(pending.reference_images, ("https://cdn.example.com/a.jpg", "https://cdn.example.com/b.jpg"))
 
 
+class TikTokLinkIntakeTests(unittest.TestCase):
+    """Auftrag 'TikTok-Link-Intake fuer Telegram+Jarvis': source_url ruft den
+    bestehenden, gemeinsamen POST /api/intake/tiktok auf und speist dessen
+    Ergebnis in dieselbe reference_images-Pipeline ein wie manuell gegebene
+    Bilder - kein zweiter Produktionspfad, keine eigene TikTok-Fachlogik hier."""
+
+    def setUp(self):
+        _production_draft.clear_pending()
+        # _validate_reference_image() prueft echte lokale Existenz+Endung -
+        # eine reale TikTok-Antwort liefert immer echte Dateien (siehe AI
+        # Content Factory tikTokIntake.ts, schreibt real unter videoAssetRoot),
+        # ein Test-Fake muss das nachbilden statt eine erfundene, nicht
+        # existierende Pfadangabe zu verwenden.
+        self._tmpdir = tempfile.mkdtemp(prefix="mark-lii-tiktok-test-")
+        self._fake_frame_a = os.path.join(self._tmpdir, "frame-0.jpg")
+        self._fake_frame_b = os.path.join(self._tmpdir, "frame-1.jpg")
+        Path(self._fake_frame_a).write_bytes(b"fake jpeg frame a")
+        Path(self._fake_frame_b).write_bytes(b"fake jpeg frame b")
+
+    def tearDown(self):
+        _production_draft.clear_pending()
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    @staticmethod
+    def _dispatch(intake_response, create_response=None):
+        """requests.post wird ZWEIMAL aufgerufen (Intake, dann Create) - per URL unterschieden, nicht per Aufrufreihenfolge, robuster gegen Umbau."""
+        def _side_effect(url, **kwargs):
+            if url.endswith("/api/intake/tiktok"):
+                return intake_response
+            return create_response or _fake_response(201, {"projectId": "proj-tiktok"})
+        return _side_effect
+
+    @patch("plugins.commercial_engine.threading.Thread")
+    @patch("plugins.commercial_engine.requests.post")
+    def test_source_url_calls_the_shared_intake_endpoint(self, mock_post, mock_thread):
+        mock_post.side_effect = self._dispatch(_fake_response(200, {"assets": [{"path": self._fake_frame_a}]}))
+        plugin.run({"product_name": "Kaffeebecher", "source_url": "https://vt.tiktok.com/abc123", **_VOICE_AND_SUBTITLE_KNOWN})
+
+        intake_call = next(c for c in mock_post.call_args_list if c[0][0].endswith("/api/intake/tiktok"))
+        self.assertEqual(intake_call[1]["json"], {"url": "https://vt.tiktok.com/abc123"})
+
+    @patch("plugins.commercial_engine.threading.Thread")
+    @patch("plugins.commercial_engine.requests.post")
+    def test_imported_asset_paths_become_productImageRef_and_productImageRefs(self, mock_post, mock_thread):
+        mock_post.side_effect = self._dispatch(_fake_response(200, {"assets": [{"path": self._fake_frame_a}, {"path": self._fake_frame_b}]}))
+        plugin.run({"product_name": "Kaffeebecher", "source_url": "https://vt.tiktok.com/abc123", **_VOICE_AND_SUBTITLE_KNOWN})
+
+        create_call = next(c for c in mock_post.call_args_list if c[0][0].endswith("/api/commercial-projects"))
+        body = create_call[1]["json"]
+        self.assertEqual(body["productImageRef"], self._fake_frame_a)
+        self.assertEqual(body["productImageRefs"], [self._fake_frame_a, self._fake_frame_b])
+
+    @patch("plugins.commercial_engine.threading.Thread")
+    @patch("plugins.commercial_engine.requests.post")
+    def test_insufficient_media_asks_for_photos_instead_of_starting_production(self, mock_post, mock_thread):
+        mock_post.side_effect = self._dispatch(_fake_response(422, {"error": {"message": "..."}}))
+        result = plugin.run({"product_name": "Kaffeebecher", "source_url": "https://vt.tiktok.com/abc123", **_VOICE_AND_SUBTITLE_KNOWN})
+
+        self.assertIn("product photos", result)
+        create_calls = [c for c in mock_post.call_args_list if c[0][0].endswith("/api/commercial-projects")]
+        self.assertEqual(len(create_calls), 0)
+
+    @patch("plugins.commercial_engine.threading.Thread")
+    @patch("plugins.commercial_engine.requests.post")
+    def test_unreachable_intake_service_gives_a_clean_english_message_no_stack_trace(self, mock_post, mock_thread):
+        import requests as _requests_module
+
+        def _side_effect(url, **kwargs):
+            if url.endswith("/api/intake/tiktok"):
+                raise _requests_module.exceptions.ConnectionError("boom")
+            return _fake_response(201, {"projectId": "proj"})
+
+        mock_post.side_effect = _side_effect
+        result = plugin.run({"product_name": "Kaffeebecher", "source_url": "https://vt.tiktok.com/abc123", **_VOICE_AND_SUBTITLE_KNOWN})
+
+        self.assertIn("unreachable", result)
+        self.assertNotIn("Traceback", result)
+        create_calls = [c for c in mock_post.call_args_list if c[0][0].endswith("/api/commercial-projects")]
+        self.assertEqual(len(create_calls), 0)
+
+    @patch("plugins.commercial_engine.threading.Thread")
+    @patch("plugins.commercial_engine.requests.post")
+    def test_missing_voice_and_subtitle_after_a_successful_import_still_asks_and_remembers_the_images(self, mock_post, mock_thread):
+        mock_post.side_effect = self._dispatch(_fake_response(200, {"assets": [{"path": self._fake_frame_a}]}))
+        first = plugin.run({"product_name": "Kaffeebecher", "category": 1, "source_url": "https://vt.tiktok.com/abc123"})
+        self.assertEqual(first, plugin._QUESTION_BY_MISSING_FIELD["voice_preference"])
+        create_calls = [c for c in mock_post.call_args_list if c[0][0].endswith("/api/commercial-projects")]
+        self.assertEqual(len(create_calls), 0, "should ask for voice/subtitle first, not start production yet")
+
+        pending = _production_draft.get_pending()
+        self.assertEqual(pending.reference_images, (self._fake_frame_a,))
+
+        # Zweiter Aufruf OHNE erneutes source_url - kein zweiter Intake-Aufruf noetig, die Bilder sind schon im Pending-Draft.
+        intake_calls_before = len([c for c in mock_post.call_args_list if c[0][0].endswith("/api/intake/tiktok")])
+        plugin.run({"voice_preference": "female", "subtitle_style": "clean"})
+        intake_calls_after = len([c for c in mock_post.call_args_list if c[0][0].endswith("/api/intake/tiktok")])
+        self.assertEqual(intake_calls_before, intake_calls_after)
+
+        create_call = next(c for c in mock_post.call_args_list if c[0][0].endswith("/api/commercial-projects"))
+        self.assertEqual(create_call[1]["json"]["productImageRefs"], [self._fake_frame_a])
+
+
 class MissingVoiceAndSubtitlePreferenceTests(unittest.TestCase):
     """Auftrag 'Jarvis - fehlende Parameter abfragen': category 1/2 requires
     voice_preference AND subtitle_style before create_video_production_request
@@ -541,9 +645,29 @@ class CheckVideoProductionStatusTests(unittest.TestCase):
 
     @patch("plugins.commercial_engine_status.requests.get")
     def test_retryable_failure_is_named_as_such(self, mock_get):
-        mock_get.return_value = _fake_response(200, {"status": "GENERATION_FAILED", "currentStage": "GENERATION", "retryable": True, "finalOutput": None})
+        # failedStage gesetzt (wie die echte API es fuer einen echten Fehlschlag immer sendet,
+        # siehe apps/api's toCommercialProjectStatusView()) - das ist seit dem WAN/ComfyUI-
+        # Recovery-Fix der Unterschied zwischen "hat wirklich einen Fehler" und "laeuft nur noch".
+        mock_get.return_value = _fake_response(
+            200, {"status": "GENERATION_FAILED", "currentStage": "GENERATION", "failedStage": "GENERATION", "retryable": True, "finalOutput": None}
+        )
         result = status_plugin.run({"project_id": "proj-1"})
         self.assertIn("retry", result.lower())
+        self.assertIn("problem", result.lower())
+
+    @patch("plugins.commercial_engine_status.requests.get")
+    def test_still_generating_but_retryable_WITHOUT_failedStage_is_reported_as_normal_progress_not_a_problem(self, mock_get):
+        # Auftrag "WAN/ComfyUI Timeout und Recovery" (2026-09-13): ein Projekt in GENERATING
+        # ist retryable (der Endpunkt kann den laufenden Job weiterverfolgen), aber NICHT
+        # fehlgeschlagen - failedStage bleibt null (siehe apps/api). Jarvis darf hier NICHT
+        # sagen, es sei "ein Problem aufgetreten" - real gefundene Regression beim Schreiben
+        # dieses Auftrags, bevor sie ausgeliefert wurde.
+        mock_get.return_value = _fake_response(
+            200, {"status": "GENERATING", "currentStage": "GENERATION", "failedStage": None, "retryable": True, "finalOutput": None}
+        )
+        result = status_plugin.run({"project_id": "proj-1"})
+        self.assertNotIn("problem", result.lower(), "GENERATING ist kein Fehlschlag - darf nicht wie einer klingen")
+        self.assertIn("longer than usual", result.lower())
 
     @patch("plugins.commercial_engine_status.requests.get")
     def test_unknown_project_id_returns_404_as_clear_message(self, mock_get):

@@ -129,6 +129,18 @@ PLUGIN = {
                     "no photo was given."
                 ),
             },
+            "source_url": {
+                "type": "STRING",
+                "description": (
+                    "A TikTok video link (tiktok.com, vm.tiktok.com, or vt.tiktok.com), ONLY if the user gave "
+                    "one and wants a video made FROM that TikTok post's product material - e.g. 'create a "
+                    "video from this TikTok link', 'make me a Category 1 video out of <link>'. Product images "
+                    "are extracted automatically from the linked video - do NOT also ask for or pass "
+                    "reference_image/reference_images in the same call. The user still needs to say the "
+                    "product name themselves (this does not invent one). Leave out entirely when no TikTok "
+                    "link was given."
+                ),
+            },
             "duration_seconds": {
                 "type": "NUMBER",
                 "description": "Requested video length in seconds (e.g. 5, 10, 15), only if the user actually said or clearly implied one - never invent a number.",
@@ -187,6 +199,13 @@ _CREATE_TIMEOUT_SECONDS = 10
 # Generous but finite ceiling for the background production-run call - never
 # infinite (see task requirement: no unbounded loops/retries).
 _RUN_TIMEOUT_SECONDS = 3 * 60 * 60
+# TikTok-Import (echter Download + Frame-Extraktion, siehe AI Content Factory
+# routes/intake.ts) ist synchron, kein zweiter Hintergrund-Thread wie beim
+# eigentlichen Produktions-Run - anders als eine 30-min-WAN-Render dauert ein
+# echter Import typischerweise nur wenige Sekunden, ein kurzes Blockieren
+# des Live-Voice-Turns dafuer ist akzeptabel (gleiches Prinzip wie der
+# bereits bestehende, ebenfalls synchrone _validate_reference_image()-Check).
+_TIKTOK_INTAKE_TIMEOUT_SECONDS = 90
 _ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 _ALLOWED_ASPECT_RATIOS = {"9:16", "16:9", "1:1", "4:3", "3:4", "9:21", "21:9"}
 _ALLOWED_PLATFORMS = {"tiktok", "instagram", "youtube", "facebook", "other"}
@@ -300,6 +319,36 @@ def _run_via_n8n(webhook_url: str, product_name: str, parameters: dict, product_
         pass
 
 
+def _import_from_tiktok_url(url: str) -> tuple[list[str] | None, str | None]:
+    """Ruft den bestehenden, gemeinsamen POST /api/intake/tiktok auf (siehe AI
+    Content Factory apps/api/src/routes/intake.ts) - EIN Service fuer Telegram
+    UND Jarvis, keine eigene TikTok-Fachlogik/kein eigener Extractor hier
+    (Auftrag "TikTok-Link-Intake fuer Telegram+Jarvis" Abschnitt 23: "dieselbe
+    gemeinsame Intake-Komponente aufrufen"). Gibt (image_paths, None) bei
+    Erfolg oder (None, friendly_error_message) zurueck - Meldungen bewusst
+    auf Englisch (wie der Rest dieser Datei), NIE die rohe (deutsche)
+    API-Fehlermeldung direkt weitergereicht, um keinen Sprachmischmasch im
+    gesprochenen Ergebnis zu erzeugen."""
+    try:
+        response = requests.post(f"{_base_url()}/api/intake/tiktok", json={"url": url}, timeout=_TIKTOK_INTAKE_TIMEOUT_SECONDS)
+    except requests.exceptions.RequestException:
+        return None, "The TikTok import service is currently unreachable. Please make sure the Commercial Engine API is running."
+    if response.status_code == 422:
+        # TIKTOK_INTAKE_NO_USABLE_MEDIA (siehe errors.ts) - Quality Gate hat abgelehnt.
+        return None, "I couldn't extract enough usable product material from that TikTok link. Please send one or more product photos instead."
+    if not response.ok:
+        return None, "That TikTok link could not be imported. Please check the link, or send product photos instead."
+    try:
+        body = response.json()
+        assets = body.get("assets") or []
+        paths = [a.get("path") for a in assets if isinstance(a, dict) and isinstance(a.get("path"), str) and a.get("path")]
+    except Exception:
+        return None, "The TikTok import returned an unexpected response."
+    if not paths:
+        return None, "I couldn't extract enough usable product material from that TikTok link. Please send one or more product photos instead."
+    return paths, None
+
+
 def _validate_reference_image(raw_path: str) -> tuple[str | None, str | None]:
     """Returns (productImageRef_value, error_message) - exactly one is None."""
     path = raw_path.strip()
@@ -352,6 +401,27 @@ def _merge_parameters_into_pending(parameters: dict) -> PendingProductionDraft:
 def run(parameters: dict, player=None, session_memory=None) -> str:
     try:
         draft = _merge_parameters_into_pending(parameters)
+
+        # TikTok-Link-Intake (Auftrag "TikTok-Link-Intake fuer Telegram+Jarvis"):
+        # nur verarbeiten, wenn DIESER Aufruf tatsaechlich source_url mitgibt -
+        # nicht bei jedem Folgeaufruf erneut, die bereits importierten Pfade
+        # stecken danach in draft.reference_images und bleiben dort ueber
+        # merged_with() hinweg erhalten (siehe PendingProductionDraft). Laeuft
+        # VOR der product_name-Pruefung unten, aber unabhaengig davon - der
+        # Produktname kommt weiterhin vom Nutzer, TikTok ersetzt nur die Bilder.
+        source_url = parameters.get("source_url")
+        if isinstance(source_url, str) and source_url.strip():
+            imported_paths, import_error = _import_from_tiktok_url(source_url.strip())
+            if import_error:
+                # Kein halbfertiger Pending-Zustand mit einem fehlgeschlagenen
+                # Import - der Nutzer soll klar neu anfangen koennen (Bilder
+                # senden oder einen anderen Link), kein verwirrendes Rueckfragen
+                # nach Kategorie/Stimme fuer ein Produkt ohne jedes Bildmaterial.
+                clear_pending()
+                return import_error
+            draft = draft.merged_with(reference_images=tuple(imported_paths))
+            set_pending(draft)
+
         product_name = draft.product_name or ""
         if not product_name:
             # Kein Pending-Zustand fuer ein Produkt, das noch nicht einmal einen

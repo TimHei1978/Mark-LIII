@@ -82,8 +82,15 @@ def run(parameters: dict, player=None, session_memory=None) -> str:
             final_output = status.get("finalOutput") or {}
             path = final_output.get("path", "an unknown location")
             result_text = f"Project {project_id} is done - the finished video is at {path}."
-        elif status.get("retryable"):
+        elif status.get("retryable") and status.get("failedStage"):
+            # `retryable` alone is NOT proof of a failure since the WAN/ComfyUI recovery fix
+            # (2026-09-13): a still-GENERATING project is also retryable (a long-running
+            # provider job can be nudged along via the same endpoint), but nothing actually
+            # went wrong there - `failedStage` is only set when the project genuinely failed
+            # (see apps/api's toCommercialProjectStatusView()), so it is the real disambiguator.
             result_text = f"Project {project_id} hit a problem during {stage_text} and can be retried - want me to retry it?"
+        elif status.get("retryable"):
+            result_text = f"Project {project_id} is taking longer than usual to generate ({stage_text}) - nothing has gone wrong, want me to check on it again?"
         elif stage_text == "failed":
             result_text = f"Project {project_id} failed and is not retryable."
         else:
