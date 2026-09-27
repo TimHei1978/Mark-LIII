@@ -47,6 +47,31 @@ def _base_url() -> str:
     return os.environ.get("ACF_API_BASE_URL", _DEFAULT_BASE_URL).rstrip("/")
 
 
+def _format_mmss(ms) -> str:
+    total_seconds = int(round((ms or 0) / 1000))
+    return f"{total_seconds // 60}:{total_seconds % 60:02d}"
+
+
+def _summarize_clips(clips: list) -> str:
+    """Natural-language summary, no raw internal scores/paths (Auftrag 'SINGLE_CLIP-Modus':
+    'natuerlichsprachliche Zusammenfassungen, keine rohen Scores, ausser explizit angefragt')."""
+    if not clips:
+        return "No clips yet."
+    if len(clips) == 1 and clips[0].get("mode") == "SINGLE_CLIP":
+        c = clips[0]
+        duration_s = round((c.get("durationMs") or 0) / 1000)
+        start = _format_mmss(c.get("startMs"))
+        end = _format_mmss(c.get("endMs"))
+        qc_note = "" if c.get("qcValid", True) else " (quality check flagged something - worth a look)"
+        return f"One continuous clip, about {duration_s} seconds long, from {start} to {end}.{qc_note}"
+    parts = []
+    for c in clips[:5]:
+        duration_s = round((c.get("durationMs") or 0) / 1000)
+        parts.append(f"{duration_s}s")
+    more = f" and {len(clips) - 5} more" if len(clips) > 5 else ""
+    return f"{len(clips)} clip(s) so far ({', '.join(parts)}{more})."
+
+
 def run(parameters: dict, player=None, session_memory=None) -> str:
     try:
         source_query = parameters.get("source_query")
@@ -88,8 +113,7 @@ def run(parameters: dict, player=None, session_memory=None) -> str:
         status = results.get("status", "unknown")
         message = results.get("message", "")
         clips = results.get("clips", [])
-        clip_count_note = f" {len(clips)} clip(s) so far." if clips else ""
-        result_text = f"'{friendly_name}' is in status {status}. {message}{clip_count_note}".strip()
+        result_text = f"'{friendly_name}' is in status {status}. {message} {_summarize_clips(clips)}".strip()
     except Exception as e:
         return f"Sir, check_clipping_status failed: {e}"
 

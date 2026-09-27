@@ -109,6 +109,86 @@ class StartClippingJobTests(unittest.TestCase):
         sent_body = mock_post.call_args.kwargs["json"]
         self.assertEqual(sent_body["manualRange"], {"startMs": 750000, "endMs": 795000})
 
+    @patch("plugins.clipping_command.requests.get")
+    @patch("plugins.clipping_command.requests.post")
+    def test_single_clip_explicit_timestamp(self, mock_post, mock_get):
+        mock_get.return_value = _fake_response(200, {"outcome": "FOUND", "source": _SOURCE})
+        mock_post.return_value = _fake_response(200, {"source": _SOURCE, "mode": "SINGLE_CLIP"})
+
+        clipping_command.run({"mode": "SINGLE_CLIP", "start_timestamp_seconds": 135})
+
+        sent_body = mock_post.call_args.kwargs["json"]
+        self.assertEqual(sent_body["startMs"], 135000)
+        self.assertNotIn("semanticStartInstruction", sent_body)
+        self.assertNotIn("manualRange", sent_body)
+
+    @patch("plugins.clipping_command.requests.get")
+    @patch("plugins.clipping_command.requests.post")
+    def test_single_clip_explicit_timestamp_with_target_duration(self, mock_post, mock_get):
+        mock_get.return_value = _fake_response(200, {"outcome": "FOUND", "source": _SOURCE})
+        mock_post.return_value = _fake_response(200, {"source": _SOURCE, "mode": "SINGLE_CLIP"})
+
+        clipping_command.run({"mode": "SINGLE_CLIP", "start_timestamp_seconds": 135, "target_duration_seconds": 45})
+
+        sent_body = mock_post.call_args.kwargs["json"]
+        self.assertEqual(sent_body["startMs"], 135000)
+        self.assertEqual(sent_body["targetDurationMs"], 45000)
+
+    @patch("plugins.clipping_command.requests.get")
+    @patch("plugins.clipping_command.requests.post")
+    def test_single_clip_semantic_start(self, mock_post, mock_get):
+        mock_get.return_value = _fake_response(200, {"outcome": "FOUND", "source": _SOURCE})
+        mock_post.return_value = _fake_response(200, {"source": _SOURCE, "mode": "SINGLE_CLIP"})
+
+        clipping_command.run({"mode": "SINGLE_CLIP", "semantic_start_instruction": "where he talks about the packaging", "target_duration_seconds": 60})
+
+        sent_body = mock_post.call_args.kwargs["json"]
+        self.assertEqual(sent_body["semanticStartInstruction"], "where he talks about the packaging")
+        self.assertEqual(sent_body["targetDurationMs"], 60000)
+        self.assertNotIn("startMs", sent_body)
+
+    @patch("plugins.clipping_command.requests.get")
+    @patch("plugins.clipping_command.requests.post")
+    def test_single_clip_explicit_range_forces_strict_policies(self, mock_post, mock_get):
+        mock_get.return_value = _fake_response(200, {"outcome": "FOUND", "source": _SOURCE})
+        mock_post.return_value = _fake_response(200, {"source": _SOURCE, "mode": "SINGLE_CLIP"})
+
+        clipping_command.run({"mode": "SINGLE_CLIP", "manual_range_start_seconds": 750, "manual_range_end_seconds": 795})
+
+        sent_body = mock_post.call_args.kwargs["json"]
+        self.assertEqual(sent_body["startMs"], 750000)
+        self.assertEqual(sent_body["targetDurationMs"], 45000)
+        self.assertEqual(sent_body["startPolicy"], "STRICT_START")
+        self.assertEqual(sent_body["endPolicy"], "STRICT")
+
+    @patch("plugins.clipping_command.requests.get")
+    def test_single_clip_without_any_start_input_asks_instead_of_calling_post(self, mock_get):
+        mock_get.return_value = _fake_response(200, {"outcome": "FOUND", "source": _SOURCE})
+        with patch("plugins.clipping_command.requests.post") as mock_post:
+            result = clipping_command.run({"mode": "SINGLE_CLIP"})
+            mock_post.assert_not_called()
+        self.assertIn("exactly one", result)
+
+    @patch("plugins.clipping_command.requests.get")
+    def test_single_clip_with_both_timestamp_and_semantic_start_asks_instead_of_calling_post(self, mock_get):
+        mock_get.return_value = _fake_response(200, {"outcome": "FOUND", "source": _SOURCE})
+        with patch("plugins.clipping_command.requests.post") as mock_post:
+            result = clipping_command.run({"mode": "SINGLE_CLIP", "start_timestamp_seconds": 10, "semantic_start_instruction": "at the start"})
+            mock_post.assert_not_called()
+        self.assertIn("exactly one", result)
+
+    @patch("plugins.clipping_command.requests.get")
+    @patch("plugins.clipping_command.requests.post")
+    def test_single_clip_ambiguous_start_surfaces_clarifying_question_not_a_generic_error(self, mock_post, mock_get):
+        mock_get.return_value = _fake_response(200, {"outcome": "FOUND", "source": _SOURCE})
+        mock_post.return_value = _fake_response(422, {"error": {"code": "AMBIGUOUS_SINGLE_CLIP_START", "message": "matches sentence 5 and sentence 12"}})
+
+        result = clipping_command.run({"mode": "SINGLE_CLIP", "semantic_start_instruction": "where he talks about pricing"})
+
+        self.assertIn("more than one place", result)
+        self.assertIn("sentence 5", result)
+        self.assertNotIn("could not be started", result)
+
     def test_invalid_mode_rejected_without_any_network_call(self):
         with patch("plugins.clipping_command.requests.get") as mock_get, patch("plugins.clipping_command.requests.post") as mock_post:
             result = clipping_command.run({"mode": "NOT_A_MODE"})
@@ -147,6 +227,39 @@ class CheckClippingStatusTests(unittest.TestCase):
         mock_get.return_value = _fake_response(404)
         result = clipping_status.run({})
         self.assertIn("couldn't find", result)
+
+    @patch("plugins.clipping_status.requests.get")
+    def test_single_clip_ready_result_gets_a_natural_language_summary_not_raw_scores(self, mock_get):
+        mock_get.side_effect = [
+            _fake_response(200, {"outcome": "FOUND", "source": _SOURCE}),
+            _fake_response(200, {
+                "status": "READY",
+                "message": "Clips sind fertig.",
+                "clips": [{"mode": "SINGLE_CLIP", "startMs": 135000, "endMs": 182000, "durationMs": 47000, "qcValid": True, "boundaryScore": 0.83}],
+            }),
+        ]
+        result = clipping_status.run({"source_query": "Folge 12"})
+        self.assertIn("47 seconds", result)
+        self.assertIn("2:15", result)
+        self.assertIn("3:02", result)
+        self.assertNotIn("0.83", result)
+        self.assertNotIn("boundaryScore", result)
+
+    @patch("plugins.clipping_status.requests.get")
+    def test_multi_clip_ready_result_summarizes_durations_not_a_bare_count(self, mock_get):
+        mock_get.side_effect = [
+            _fake_response(200, {"outcome": "FOUND", "source": _SOURCE}),
+            _fake_response(200, {
+                "status": "READY",
+                "message": "Clips sind fertig.",
+                "clips": [
+                    {"durationMs": 30000, "qcValid": True},
+                    {"durationMs": 42000, "qcValid": True},
+                ],
+            }),
+        ]
+        result = clipping_status.run({"source_query": "Folge 12"})
+        self.assertIn("2 clip(s)", result)
 
 
 if __name__ == "__main__":

@@ -62,12 +62,40 @@ PLUGIN = {
         "videos, it returns a clarifying question; ask the user and call this function again "
         "with a more specific source_query, do not pick one yourself.\n\n"
         "MODE: exactly one of AUTO (automatic best-clip selection - optionally set max_clips, "
-        "default 5), KEYWORD (pass keywords as a list of search terms/topics), INSTRUCTION "
-        "(pass instruction_text - the user's free-form description of what to find, forward "
-        "it close to verbatim, the semantic interpretation happens in the Content Factory "
-        "itself, do not pre-summarize or simplify it), or MANUAL (pass "
+        "default 5, produces MULTIPLE short clips), KEYWORD (pass keywords as a list of search "
+        "terms/topics, produces MULTIPLE clips), INSTRUCTION (pass instruction_text - the "
+        "user's free-form description of what to find, forward it close to verbatim, the "
+        "semantic interpretation happens in the Content Factory itself, do not pre-summarize "
+        "or simplify it, produces MULTIPLE clips), MANUAL (pass "
         "manual_range_start_seconds/manual_range_end_seconds - convert any spoken timestamp "
-        "like '12:30' or '00:12:30' into seconds yourself, e.g. 12:30 -> 750)."
+        "like '12:30' or '00:12:30' into seconds yourself, e.g. 12:30 -> 750, produces ONE clip "
+        "with that exact range), or SINGLE_CLIP (produces EXACTLY ONE continuous, naturally-"
+        "bounded clip - the user must never be forced to cut a wanted one-minute clip exactly "
+        "mid-sentence, see below).\n\n"
+        "SINGLE_CLIP: use when the user wants exactly ONE continuous clip (not several short "
+        "ones). Its start must be given in EXACTLY ONE of these three ways: (a) "
+        "start_timestamp_seconds - an explicit spoken timestamp, converted to seconds yourself "
+        "(e.g. '2 minutes 15 seconds' -> 135); (b) semantic_start_instruction - a natural-"
+        "language description of WHERE the clip should start (e.g. 'where he talks about the "
+        "packaging'), forwarded close to verbatim - the Content Factory resolves this against "
+        "the real transcript and will ask a clarifying question (never guesses) if it is "
+        "ambiguous, in which case relay that question to the user and call this function again "
+        "with a more specific description; (c) manual_range_start_seconds AND "
+        "manual_range_end_seconds together - an explicit start AND end (the clip will be cut "
+        "EXACTLY there, no natural-boundary search). Optionally set target_duration_seconds "
+        "(a GOAL, not a hard cut - the actual clip may end up a bit shorter or longer so it "
+        "doesn't cut off mid-sentence or mid-thought) - omit it for a sensible default "
+        "(~45 seconds). Five example user requests this covers: "
+        "1) 'Jarvis, take the new video and give me one continuous clip starting at 2 minutes "
+        "15 seconds.' (explicit timestamp) "
+        "2) 'Jarvis, cut me a 45 second clip from Podcast Episode 12 starting right where he "
+        "talks about the packaging.' (semantic start + target duration) "
+        "3) 'Jarvis, make one clip from 12:30 to 13:15 from the new video.' (explicit start/end "
+        "range) "
+        "4) 'Jarvis, give me a single clip about the pricing discussion, around a minute long.' "
+        "(instruction-based/semantic start + target duration) "
+        "5) 'Jarvis, take the part where the first company failed and turn it into one clip, "
+        "don't cut it off mid-sentence.' (semantic start, natural completion emphasised)."
     ),
     "parameters": {
         "type": "OBJECT",
@@ -78,7 +106,7 @@ PLUGIN = {
             },
             "mode": {
                 "type": "STRING",
-                "description": "One of AUTO, KEYWORD, INSTRUCTION, MANUAL.",
+                "description": "One of AUTO, KEYWORD, INSTRUCTION, MANUAL, SINGLE_CLIP.",
             },
             "max_clips": {
                 "type": "INTEGER",
@@ -95,11 +123,23 @@ PLUGIN = {
             },
             "manual_range_start_seconds": {
                 "type": "NUMBER",
-                "description": "MANUAL only - clip start time in seconds (convert any spoken timestamp yourself, e.g. 12:30 -> 750).",
+                "description": "MANUAL, or SINGLE_CLIP with an explicit start+end range - clip start time in seconds (convert any spoken timestamp yourself, e.g. 12:30 -> 750).",
             },
             "manual_range_end_seconds": {
                 "type": "NUMBER",
-                "description": "MANUAL only - clip end time in seconds.",
+                "description": "MANUAL, or SINGLE_CLIP with an explicit start+end range - clip end time in seconds.",
+            },
+            "start_timestamp_seconds": {
+                "type": "NUMBER",
+                "description": "SINGLE_CLIP only - an explicit start timestamp in seconds (start-input type 'explicit timestamp'/'explicit start + target duration'), convert any spoken timestamp yourself.",
+            },
+            "semantic_start_instruction": {
+                "type": "STRING",
+                "description": "SINGLE_CLIP only - a natural-language description of WHERE the clip should start (start-input type 'semantic start'/'instruction-based start'), forwarded close to verbatim.",
+            },
+            "target_duration_seconds": {
+                "type": "NUMBER",
+                "description": "SINGLE_CLIP only - the desired approximate clip length in seconds, a GOAL not a hard cut. Omit for the system default (~45s).",
             },
         },
         "required": ["mode"],
@@ -108,7 +148,7 @@ PLUGIN = {
 
 _DEFAULT_BASE_URL = "http://localhost:3000"
 _REQUEST_TIMEOUT_SECONDS = 15
-_ALLOWED_MODES = {"AUTO", "KEYWORD", "INSTRUCTION", "MANUAL"}
+_ALLOWED_MODES = {"AUTO", "KEYWORD", "INSTRUCTION", "MANUAL", "SINGLE_CLIP"}
 
 
 def _base_url() -> str:
@@ -178,6 +218,35 @@ def run(parameters: dict, player=None, session_memory=None) -> str:
             if not isinstance(start_seconds, (int, float)) or not isinstance(end_seconds, (int, float)):
                 return "What start and end time should the clip cover?"
             body["manualRange"] = {"startMs": int(start_seconds * 1000), "endMs": int(end_seconds * 1000)}
+        elif mode == "SINGLE_CLIP":
+            start_seconds = parameters.get("start_timestamp_seconds")
+            semantic_start = parameters.get("semantic_start_instruction")
+            range_start = parameters.get("manual_range_start_seconds")
+            range_end = parameters.get("manual_range_end_seconds")
+            target_duration = parameters.get("target_duration_seconds")
+
+            has_explicit_range = isinstance(range_start, (int, float)) and isinstance(range_end, (int, float))
+            has_timestamp = isinstance(start_seconds, (int, float))
+            has_semantic = bool(isinstance(semantic_start, str) and semantic_start.strip())
+            provided_count = sum([has_explicit_range, has_timestamp, has_semantic])
+            if provided_count != 1:
+                return (
+                    "For a single continuous clip I need exactly one of: an explicit start "
+                    "timestamp, a description of where it should start, or an explicit start "
+                    "and end range."
+                )
+
+            if has_explicit_range:
+                body["startMs"] = int(range_start * 1000)
+                body["targetDurationMs"] = int((range_end - range_start) * 1000)
+                body["startPolicy"] = "STRICT_START"
+                body["endPolicy"] = "STRICT"
+            elif has_timestamp:
+                body["startMs"] = int(start_seconds * 1000)
+            else:
+                body["semanticStartInstruction"] = semantic_start.strip()
+            if isinstance(target_duration, (int, float)) and target_duration > 0 and not has_explicit_range:
+                body["targetDurationMs"] = int(target_duration * 1000)
 
         try:
             response = requests.post(f"{_base_url()}/api/clipping/commands", json=body, timeout=_REQUEST_TIMEOUT_SECONDS)
@@ -186,17 +255,17 @@ def run(parameters: dict, player=None, session_memory=None) -> str:
 
         if not response.ok:
             try:
-                detail = response.json().get("error", {}).get("message", response.text[:300])
+                error_body = response.json().get("error", {})
+                detail = error_body.get("message", response.text[:300])
+                error_code = error_body.get("code")
             except Exception:
-                detail = response.text[:300]
+                detail, error_code = response.text[:300], None
+            if error_code == "AMBIGUOUS_SINGLE_CLIP_START":
+                return f"That could start in more than one place: {detail} Please describe more specifically where it should start."
             return f"The Clipping job could not be started: {detail}"
 
         friendly_name = source.get("friendlyName", "the video")
-        result_text = (
-            f"Clipping job accepted for '{friendly_name}' (mode: {mode.lower()}, source ID {source_id}). "
-            f"Note: the actual clip-selection/rendering engine for Production Path 6 is not built yet, "
-            f"so no clips exist yet - ask me to check the status later once it is."
-        )
+        result_text = f"Clipping job accepted for '{friendly_name}' (mode: {mode.lower()}, source ID {source_id}). It's transcribing/analyzing/rendering now - ask me to check the status in a few minutes."
     except Exception as e:
         return f"Sir, start_clipping_job failed: {e}"
 
