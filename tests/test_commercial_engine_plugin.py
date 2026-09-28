@@ -126,12 +126,154 @@ class CreateVideoProductionRequestTests(unittest.TestCase):
 
     @patch("plugins.commercial_engine.threading.Thread")
     @patch("plugins.commercial_engine.requests.post")
-    def test_invalid_category_falls_back_to_default_not_forwarded_as_garbage(self, mock_post, mock_thread):
-        mock_post.return_value = _fake_response(201, {"projectId": "proj-x"})
-        plugin.run({"product_name": "Stuhl", "category": 7, **_VOICE_AND_SUBTITLE_KNOWN})
-        # 7 is not a real category (1/2/3) - it must never be forwarded as-is;
-        # it falls back to the same safe default as a missing category.
-        self.assertEqual(mock_post.call_args[1]["json"]["category"], plugin._DEFAULT_PRODUCTION_CATEGORY)
+    def test_invalid_category_asks_instead_of_silently_defaulting(self, mock_post, mock_thread):
+        # Auftrag "HARDENING-RUNDE" Prioritaet B/Phase 4: an explicitly-given,
+        # unrecognized category must NEVER be silently forwarded as-is NOR
+        # silently replaced by the default (that was this exact test's OLD,
+        # now-corrected assertion) - it must ask instead, no API call at all.
+        result = plugin.run({"product_name": "Stuhl", "category": 7, **_VOICE_AND_SUBTITLE_KNOWN})
+        self.assertEqual(mock_post.call_count, 0)
+        self.assertIn("Produktionsweg", result)
+        self.assertNotIn("Started a video production job", result)
+
+    # --- Auftrag "HARDENING-RUNDE" Prioritaet A/B/D: production_path (alle sechs Wege, per Nummer oder Name) ---
+    # Integration-level tests for the new `production_path` parameter through run() - the pure
+    # resolution logic itself is covered exhaustively in test_production_paths.py; these confirm
+    # run() wires it to the correct legacyCategory sent to the real API and never duplicates
+    # provider logic here (Auftrag: "Keine eigene Provider-Logik in Jarvis bauen").
+
+    @patch("plugins.commercial_engine.threading.Thread")
+    @patch("plugins.commercial_engine.requests.post")
+    def test_production_path_numeric_2_sends_legacy_category_4_open_generative_ai(self, mock_post, mock_thread):
+        # THE critical case this whole priority exists for: displayNumber 2
+        # (Open Generative AI) must NEVER be sent as raw category=2 (that
+        # would silently route to Local Story/WAN instead).
+        mock_post.return_value = _fake_response(201, {"projectId": "proj-p2"})
+        result = plugin.run({"product_name": "Stuhl", "production_path": "2", **_VOICE_AND_SUBTITLE_KNOWN})
+        self.assertEqual(mock_post.call_args[1]["json"]["category"], 4)
+        self.assertIn("Open Generative AI", result)
+
+    @patch("plugins.commercial_engine.threading.Thread")
+    @patch("plugins.commercial_engine.requests.post")
+    def test_production_path_numeric_3_sends_legacy_category_2_local_story_wan(self, mock_post, mock_thread):
+        mock_post.return_value = _fake_response(201, {"projectId": "proj-p3"})
+        plugin.run({"product_name": "Stuhl", "production_path": "3", **_VOICE_AND_SUBTITLE_KNOWN})
+        self.assertEqual(mock_post.call_args[1]["json"]["category"], 2)
+
+    @patch("plugins.commercial_engine.threading.Thread")
+    @patch("plugins.commercial_engine.requests.post")
+    def test_production_path_numeric_4_sends_legacy_category_5_heygen(self, mock_post, mock_thread):
+        mock_post.return_value = _fake_response(201, {"projectId": "proj-p4"})
+        plugin.run({"product_name": "Stuhl", "production_path": "4", **_VOICE_AND_SUBTITLE_KNOWN})
+        self.assertEqual(mock_post.call_args[1]["json"]["category"], 5)
+
+    @patch("plugins.commercial_engine.threading.Thread")
+    @patch("plugins.commercial_engine.requests.post")
+    def test_production_path_numeric_5_sends_legacy_category_3_higgsfield(self, mock_post, mock_thread):
+        mock_post.return_value = _fake_response(201, {"projectId": "proj-p5"})
+        plugin.run({
+            "product_name": "Stuhl", "production_path": "5", "category3_confirmed": True, **_VOICE_AND_SUBTITLE_KNOWN,
+        })
+        self.assertEqual(mock_post.call_args[1]["json"]["category"], 3)
+
+    @patch("plugins.commercial_engine.threading.Thread")
+    @patch("plugins.commercial_engine.requests.post")
+    def test_production_path_numeric_1_sends_legacy_category_1(self, mock_post, mock_thread):
+        mock_post.return_value = _fake_response(201, {"projectId": "proj-p1"})
+        plugin.run({"product_name": "Stuhl", "production_path": "1", **_VOICE_AND_SUBTITLE_KNOWN})
+        self.assertEqual(mock_post.call_args[1]["json"]["category"], 1)
+
+    @patch("plugins.commercial_engine.threading.Thread")
+    @patch("plugins.commercial_engine.requests.post")
+    def test_production_path_name_open_generative_ai(self, mock_post, mock_thread):
+        mock_post.return_value = _fake_response(201, {"projectId": "proj-name-2"})
+        plugin.run({"product_name": "Stuhl", "production_path": "Open Generative AI", **_VOICE_AND_SUBTITLE_KNOWN})
+        self.assertEqual(mock_post.call_args[1]["json"]["category"], 4)
+
+    @patch("plugins.commercial_engine.threading.Thread")
+    @patch("plugins.commercial_engine.requests.post")
+    def test_production_path_name_h3(self, mock_post, mock_thread):
+        mock_post.return_value = _fake_response(201, {"projectId": "proj-h3"})
+        plugin.run({"product_name": "Stuhl", "production_path": "H3", **_VOICE_AND_SUBTITLE_KNOWN})
+        self.assertEqual(mock_post.call_args[1]["json"]["category"], 4)
+
+    @patch("plugins.commercial_engine.threading.Thread")
+    @patch("plugins.commercial_engine.requests.post")
+    def test_production_path_name_wan(self, mock_post, mock_thread):
+        mock_post.return_value = _fake_response(201, {"projectId": "proj-wan"})
+        plugin.run({"product_name": "Stuhl", "production_path": "WAN", **_VOICE_AND_SUBTITLE_KNOWN})
+        self.assertEqual(mock_post.call_args[1]["json"]["category"], 2)
+
+    @patch("plugins.commercial_engine.threading.Thread")
+    @patch("plugins.commercial_engine.requests.post")
+    def test_production_path_name_heygen(self, mock_post, mock_thread):
+        mock_post.return_value = _fake_response(201, {"projectId": "proj-heygen"})
+        plugin.run({"product_name": "Stuhl", "production_path": "HeyGen", **_VOICE_AND_SUBTITLE_KNOWN})
+        self.assertEqual(mock_post.call_args[1]["json"]["category"], 5)
+
+    @patch("plugins.commercial_engine.threading.Thread")
+    @patch("plugins.commercial_engine.requests.post")
+    def test_production_path_name_higgsfield(self, mock_post, mock_thread):
+        mock_post.return_value = _fake_response(201, {"projectId": "proj-higgs"})
+        plugin.run({
+            "product_name": "Stuhl", "production_path": "Higgsfield", "category3_confirmed": True, **_VOICE_AND_SUBTITLE_KNOWN,
+        })
+        self.assertEqual(mock_post.call_args[1]["json"]["category"], 3)
+
+    @patch("plugins.commercial_engine.threading.Thread")
+    @patch("plugins.commercial_engine.requests.post")
+    def test_production_path_clipping_is_redirected_not_forwarded(self, mock_post, mock_thread):
+        # Path 6 has its own separate plugin/API - must never reach POST
+        # /api/commercial-projects (that would hard-fail server-side).
+        result = plugin.run({"product_name": "Stuhl", "production_path": "Clipping"})
+        self.assertEqual(mock_post.call_count, 0)
+        self.assertIn("clipping", result.lower())
+
+    @patch("plugins.commercial_engine.threading.Thread")
+    @patch("plugins.commercial_engine.requests.post")
+    def test_production_path_unknown_asks_no_silent_fallback(self, mock_post, mock_thread):
+        result = plugin.run({"product_name": "Stuhl", "production_path": "OpenAI-Avatar-Dings"})
+        self.assertEqual(mock_post.call_count, 0)
+        self.assertIn("Produktionsweg", result)
+
+    @patch("plugins.commercial_engine.threading.Thread")
+    @patch("plugins.commercial_engine.requests.post")
+    def test_production_path_ambiguous_asks_no_silent_fallback(self, mock_post, mock_thread):
+        result = plugin.run({"product_name": "Stuhl", "production_path": "local composition or wan"})
+        self.assertEqual(mock_post.call_count, 0)
+        self.assertIn("mehrdeutig", result)
+
+    @patch("plugins.commercial_engine.threading.Thread")
+    @patch("plugins.commercial_engine.requests.post")
+    def test_production_path_unresolved_remembers_product_name_across_turns(self, mock_post, mock_thread):
+        # No silent fallback must not mean "forget everything else the user
+        # already said" - same cross-turn continuity as the existing missing-
+        # voice/subtitle flow (Auftrag Abschnitt 31/33/39).
+        first = plugin.run({"product_name": "Kaffeebecher", "production_path": "Produktionsweg 99"})
+        self.assertIn("Produktionsweg", first)
+        self.assertEqual(mock_post.call_count, 0)
+        mock_post.return_value = _fake_response(201, {"projectId": "proj-continued"})
+        plugin.run({"production_path": "1", **_VOICE_AND_SUBTITLE_KNOWN})
+        self.assertEqual(mock_post.call_args[1]["json"]["productName"], "Kaffeebecher")
+        self.assertEqual(mock_post.call_args[1]["json"]["category"], 1)
+
+    @patch("plugins.commercial_engine.threading.Thread")
+    @patch("plugins.commercial_engine.requests.post")
+    def test_category_1_2_3_compatibility_preserved_when_production_path_absent(self, mock_post, mock_thread):
+        # Auftrag Phase 6: "existing category 1/2/3 compatibility where
+        # intentionally preserved" - the OLD numeric field keeps working
+        # exactly as before when production_path is not used at all.
+        mock_post.return_value = _fake_response(201, {"projectId": "proj-legacy"})
+        plugin.run({"product_name": "Stuhl", "category": 2, **_VOICE_AND_SUBTITLE_KNOWN})
+        self.assertEqual(mock_post.call_args[1]["json"]["category"], 2)
+
+    @patch("plugins.commercial_engine.threading.Thread")
+    @patch("plugins.commercial_engine.requests.post")
+    def test_production_path_takes_precedence_over_legacy_category_when_both_given(self, mock_post, mock_thread):
+        mock_post.return_value = _fake_response(201, {"projectId": "proj-both"})
+        plugin.run({"product_name": "Stuhl", "category": 1, "production_path": "HeyGen", **_VOICE_AND_SUBTITLE_KNOWN})
+        self.assertEqual(mock_post.call_args[1]["json"]["category"], 5)
+
 
     # --- G) Fehlende Category-2-Hardware (o.ae. Backend-Fehler) fuehrt zu einer klaren Fehlermeldung, kein falscher Erfolg ---
 

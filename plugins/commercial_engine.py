@@ -63,11 +63,12 @@ from __future__ import annotations
 
 import os
 import threading
-from dataclasses import asdict
+from dataclasses import asdict, replace
 
 import requests
 
 from ._production_draft import PendingProductionDraft, clear_pending, get_pending, set_pending
+from ._production_paths import ProductionPathResolution, label_for_legacy_category, resolve_production_path
 
 PLUGIN = {
     "name": "create_video_production_request",
@@ -83,10 +84,29 @@ PLUGIN = {
         "check_video_production_status afterwards to find out when it's done. Do NOT use "
         "this for general video playback, editing, or YouTube search (see youtube_video "
         "for that) - this is exclusively for STARTING a new production job in our own "
-        "pipeline.\n\n"
-        "IMPORTANT - MISSING VOICE/SUBTITLE PREFERENCE PROTOCOL: for category 1, 2, or 3 "
-        "(whether the user said so explicitly or it defaulted), a German voice AND a "
-        "subtitle style are required before production can start. If either is missing, "
+        "pipeline. Do NOT use this for Video Clipping (turning an EXISTING long video into "
+        "shorter clips) - see start_clipping_job for that; if the user asks for clipping "
+        "while talking to this function, tell them to rephrase as a clipping request "
+        "instead of guessing a category for it.\n\n"
+        "PRODUCTION PATH (six paths, use production_path for this - preferred over the "
+        "older category field below): 1 Local Composition (assembles existing product "
+        "images/clips, no AI video generation, e.g. 'local composition'), 2 Open Generative "
+        "AI (free, local Wan2GP/H3 rendering, e.g. 'open generative ai', 'H3'), 3 Local "
+        "Story / WAN (free, local ComfyUI/Wan rendering, e.g. 'local story', 'WAN'), "
+        "4 HeyGen (avatar presenter video, e.g. 'HeyGen', 'avatar presenter'), 5 Higgsfield "
+        "(paid cloud AI video generation, e.g. 'Higgsfield'), 6 Clipping (NOT handled by "
+        "this function - see above). Set production_path to either the number (1-6) or the "
+        "name/alias the user actually said, e.g. 'Produktionsweg 2' -> production_path='2', "
+        "'nutze Open Generative AI' -> production_path='Open Generative AI', 'mach das mit "
+        "H3' -> production_path='H3', 'Produktionsweg 5 Higgsfield' -> production_path='5' "
+        "(or 'Higgsfield', both work). If the phrase doesn't clearly match exactly one path, "
+        "this function returns a clarifying question itself - do not guess a path yourself, "
+        "just pass through what the user said and let it ask.\n\n"
+        "IMPORTANT - MISSING VOICE/SUBTITLE PREFERENCE PROTOCOL: for any of the five "
+        "generative production paths (1 Local Composition, 2 Open Generative AI, 3 Local "
+        "Story/WAN, 4 HeyGen, 5 Higgsfield - whether selected via production_path or the "
+        "older category field, or defaulted), a German voice AND a subtitle style are "
+        "required before production can start. If either is missing, "
         "this function does NOT start anything - it returns a short spoken question "
         "instead (asking ONLY for what is still missing, never repeating what is already "
         "known) and remembers everything supplied so far. Call this SAME function again "
@@ -94,10 +114,11 @@ PLUGIN = {
         "need to repeat product_name/category/etc. - they are remembered - but repeating "
         "them is harmless). If the user cancels ('cancel', 'never mind', 'stop'), call "
         "cancel_production_draft instead of calling this function again.\n\n"
-        "IMPORTANT - CATEGORY 3 REAL-COST CONFIRMATION PROTOCOL: category 3 (Higgsfield) "
-        "is a paid cloud service, unlike category 1/2 which run locally for free. Before "
-        "category 3 can start, you must first tell the user this incurs real cost and ask "
-        "them to confirm. If category is 3 and category3_confirmed is not yet true, this "
+        "IMPORTANT - HIGGSFIELD (PATH 5 / CATEGORY 3) REAL-COST CONFIRMATION PROTOCOL: "
+        "Higgsfield is a paid cloud service, unlike paths 1/2/3 which run locally for free. "
+        "Before it can start (whether reached via production_path='Higgsfield'/'5' or the "
+        "older category=3), you must first tell the user this incurs real cost and ask "
+        "them to confirm. If Higgsfield is selected and category3_confirmed is not yet true, this "
         "function returns a short spoken question asking for that confirmation FIRST - "
         "before even asking about voice/subtitle. Only call this function again with "
         "category3_confirmed=true once the user has clearly agreed (e.g. 'yes', 'go "
@@ -153,15 +174,28 @@ PLUGIN = {
                 "type": "NUMBER",
                 "description": "Requested video length in seconds (e.g. 5, 10, 15), only if the user actually said or clearly implied one - never invent a number.",
             },
+            "production_path": {
+                "type": "STRING",
+                "description": (
+                    "PREFERRED way to select a production path - see the PRODUCTION PATH section above for "
+                    "the full 1-6 list and examples. Pass either the number the user said, as a string "
+                    "(e.g. '2', '5'), or the name/alias they used (e.g. 'Open Generative AI', 'H3', 'WAN', "
+                    "'HeyGen', 'Higgsfield'). Only set this if the user actually named or numbered a path - "
+                    "leave it out entirely otherwise (a sensible free default is used). Never used for path 6 "
+                    "(Clipping) - use start_clipping_job for that instead."
+                ),
+            },
             "category": {
                 "type": "INTEGER",
                 "description": (
-                    "Production category, ONLY set this if the user explicitly asked for one: "
+                    "OLDER, legacy way to select a production path - prefer production_path above for new "
+                    "requests, this remains only for the three paths it always covered: "
                     "1 = local composition (assembles existing product images/clips, no AI video generation), "
                     "2 = local Wan/ComfyUI (free, runs on this computer's own GPU, generates a new AI video, may be "
                     "unavailable on machines without a suitable GPU), "
                     "3 = Higgsfield (paid cloud AI video generation service). "
-                    "Leave this out entirely if the user did not specify - the Commercial Engine picks its own default."
+                    "Leave this out entirely if the user did not specify - the Commercial Engine picks its own default. "
+                    "Do not use this for HeyGen or Clipping - use production_path for those."
                 ),
             },
             "aspect_ratio": {
@@ -395,6 +429,21 @@ def _normalized_true(parameters: dict, key: str) -> bool | None:
     return True if parameters.get(key) is True else None
 
 
+def _resolve_requested_production_path(raw_value: object) -> ProductionPathResolution:
+    """Auftrag "HARDENING-RUNDE" Prioritaet A: resolves the `production_path`
+    parameter (a plain number as int/float/numeric-string, OR a name/alias)
+    to exactly one canonical path - see _production_paths.py for the full
+    displayNumber<->legacyCategory translation this relies on. Never called
+    with an empty/missing value (see run()'s guard) - always returns either a
+    resolved match or a question, never silently guesses (Auftrag Phase 4)."""
+    if isinstance(raw_value, (int, float)) and not isinstance(raw_value, bool):
+        return resolve_production_path(display_number=int(raw_value))
+    text = str(raw_value).strip()
+    if text.isdigit():
+        return resolve_production_path(display_number=int(text))
+    return resolve_production_path(name=text)
+
+
 def _merge_parameters_into_pending(parameters: dict) -> PendingProductionDraft:
     """Auftrag Abschnitt 31/33/39: baut den (moeglicherweise bereits teilweise
     bekannten) Entwurf aus dem vorherigen Turn UND den neu gelieferten Feldern -
@@ -428,6 +477,65 @@ def run(parameters: dict, player=None, session_memory=None) -> str:
     try:
         draft = _merge_parameters_into_pending(parameters)
 
+        # Auftrag "HARDENING-RUNDE" Prioritaet A/B/D: production_path (all six
+        # paths, by number 1-6 or name/alias) takes precedence over the older,
+        # narrower category field when both are given in the same call - see
+        # _production_paths.py for the displayNumber<->legacyCategory mapping
+        # this relies on. Runs BEFORE the TikTok-Intake/product_name checks
+        # below, since an unresolved path must be clarified before anything
+        # else is attempted (Auftrag Phase 4: "kein stiller Fallback" - an
+        # unrecognized/ambiguous path always asks, it is never guessed).
+        raw_production_path = parameters.get("production_path")
+        if isinstance(raw_production_path, (str, int, float)) and str(raw_production_path).strip():
+            resolution = _resolve_requested_production_path(raw_production_path)
+            if not resolution.resolved:
+                set_pending(draft)
+                if player:
+                    try:
+                        player.write_log(f"JARVIS: {resolution.question}")
+                    except Exception:
+                        pass
+                return resolution.question
+            if resolution.match.id == "CLIPPING":
+                # Path 6 has its own, separate plugin/API (start_clipping_job /
+                # POST /api/clipping/commands) - forwarding legacyCategory 6 here
+                # would hard-fail (UNSUPPORTED_CAPABILITY, see AI Content Factory
+                # apps/api/src/commercialEngine.ts). Does NOT touch/clear the
+                # pending draft - this call did not consume any of its fields.
+                redirect = (
+                    "Video-Clipping läuft über einen eigenen Befehl, nicht über die normale "
+                    "Produktvideo-Erstellung - bitte sag mir, welches Video geclippt werden soll, "
+                    "zum Beispiel 'clippe das neueste Video'."
+                )
+                if player:
+                    try:
+                        player.write_log(f"JARVIS: {redirect}")
+                    except Exception:
+                        pass
+                return redirect
+            draft = replace(draft, category=resolution.match.legacy_category)
+        elif parameters.get("category") is not None and not (
+            isinstance(parameters.get("category"), (int, float)) and int(parameters.get("category")) in (1, 2, 3)
+        ):
+            # An explicitly-given, unrecognized legacy `category` value (Auftrag
+            # Phase 4: never silently fall back to the default - that was this
+            # exact plugin's own previous behaviour, now corrected). _merge_
+            # parameters_into_pending() already dropped the bad value (never
+            # stored it), so draft itself is unaffected - just ask instead of
+            # silently proceeding as if nothing was said.
+            set_pending(draft)
+            question = (
+                f"Ich kenne keinen Produktionsweg 'category {parameters.get('category')}'. Bitte nenne einen "
+                "Weg von 1 bis 6 (1 Local Composition, 2 Open Generative AI, 3 Local Story/WAN, 4 HeyGen, "
+                "5 Higgsfield, 6 Clipping) oder den Namen des Wegs."
+            )
+            if player:
+                try:
+                    player.write_log(f"JARVIS: {question}")
+                except Exception:
+                    pass
+            return question
+
         # TikTok-Link-Intake (Auftrag "TikTok-Link-Intake fuer Telegram+Jarvis"):
         # nur verarbeiten, wenn DIESER Aufruf tatsaechlich source_url mitgibt -
         # nicht bei jedem Folgeaufruf erneut, die bereits importierten Pfade
@@ -458,8 +566,13 @@ def run(parameters: dict, player=None, session_memory=None) -> str:
         # category loest sich wie bisher auf einen konkreten Wert auf (explizit
         # ODER der bestehende Default), BEVOR die Pflichtfeld-Pruefung laeuft -
         # missing_required_fields() braucht eine konkrete category, um zu wissen,
-        # ob Voice/Subtitle/Kosten-Bestaetigung ueberhaupt relevant sind (Kategorie 1/2/3).
-        resolved_category = draft.category if draft.category in (1, 2, 3) else _DEFAULT_PRODUCTION_CATEGORY
+        # ob Voice/Subtitle/Kosten-Bestaetigung ueberhaupt relevant sind. 1-5, nicht
+        # nur 1-3 (Auftrag "HARDENING-RUNDE" Prioritaet A): draft.category kann jetzt
+        # auch 4/5 sein, wenn production_path oben erfolgreich auf HeyGen/Open
+        # Generative AI aufgeloest wurde - beide Zweige oben (production_path-
+        # Aufloesung UND der explizite-ungueltige-category-Zweig) garantieren bereits,
+        # dass hier nie ein anderer als ein gueltiger 1-5-Wert oder None ankommt.
+        resolved_category = draft.category if draft.category in (1, 2, 3, 4, 5) else _DEFAULT_PRODUCTION_CATEGORY
         draft = draft.merged_with(category=resolved_category)
 
         missing = draft.missing_required_fields()
@@ -578,7 +691,8 @@ def run(parameters: dict, player=None, session_memory=None) -> str:
 
         threading.Thread(target=_run_production_in_background, args=(project_id,), daemon=True, name=f"acf-run-{project_id}").start()
 
-        category_note = f" (category {body['category']})"
+        path_label = label_for_legacy_category(body["category"])
+        category_note = f" ({path_label}, category {body['category']})" if path_label else f" (category {body['category']})"
         result_text = (
             f"Started a video production job{category_note} for {product_name}. Project ID {project_id}. "
             f"This can take anywhere from about a minute to over an hour depending on the category - "

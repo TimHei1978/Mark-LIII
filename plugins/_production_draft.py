@@ -30,17 +30,19 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Optional
 
-# Category 1/2/3 all share the real Commercial Engine voice + subtitle
-# pipeline (see AI Content Factory COMPONENTS/telegram-production-bot.md,
-# "OmniVoice-Integration & Kategorie-2-Korrektur"). Category 3 was excluded
-# here by an earlier, now-superseded task ("Category 3 nicht ungeprueft
-# aendern") - the later Auftrag "Kategorie 3 / Higgsfield zu einer echten
-# Premium-Werbevideo-Pipeline reparieren" (2026-09-13) explicitly requires
-# Jarvis to use "die gleichen Felder wie Telegram (voicePreference,
-# subtitleStyle, category), keine zweite Kategorie-3-Engine" - Telegram now
-# asks voice+subtitle for category 3 too (see apps/telegram-bot/src/
-# updateHandler.ts continueFlow()), so Jarvis must match.
-_CATEGORIES_REQUIRING_VOICE_AND_SUBTITLE = (1, 2, 3)
+# Legacy categories 1/2/3/4/5 (= ALL FIVE generative production paths - see
+# _production_paths.py for the displayNumber<->legacyCategory mapping; 6/
+# Clipping never reaches this module, it has no voice/subtitle concept at
+# all) share the real Commercial Engine voice + subtitle pipeline (see AI
+# Content Factory COMPONENTS/telegram-production-bot.md, "OmniVoice-
+# Integration & Kategorie-2-Korrektur"). Originally only 1/2/3 (Local
+# Composition/Local Story-WAN/Higgsfield) were reachable from Jarvis at all;
+# Auftrag "HARDENING-RUNDE" Prioritaet A made Open Generative AI (legacy 4)
+# and HeyGen (legacy 5) reachable too - both are wired to the exact same
+# CommercialVoiceoverStage (OmniVoice) as 1/2/3 in apps/api/src/
+# commercialEngine.ts, so they must ask the same question, not silently
+# skip it.
+_CATEGORIES_REQUIRING_VOICE_AND_SUBTITLE = (1, 2, 3, 4, 5)
 # Category 3 (Higgsfield) is a paid cloud service - real money, unlike
 # category 1/2's local compute. Telegram gates it behind an explicit tap on
 # category3ConfirmKeyboard() BEFORE even asking voice/subtitle; Jarvis has no
